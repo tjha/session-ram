@@ -47,8 +47,13 @@ def write_json(path, value):
 
 
 def settings():
+    """The shared settings, keeping any keys this script doesn't know so a write never drops them."""
     s = read_json(SETTINGS, {})
-    return {"limitMb": int(s.get("limitMb") or DEFAULT_LIMIT_MB), "isAuto": s.get("isAuto") is True}
+    s = s if isinstance(s, dict) else {}
+    s["limitMb"] = int(s.get("limitMb") or DEFAULT_LIMIT_MB)
+    s["isAuto"] = s.get("isAuto") is True
+    s["autoOpenPanel"] = s.get("autoOpenPanel") is not False
+    return s
 
 
 def parse_ps(out):
@@ -173,6 +178,8 @@ def act(args):
         if time.time() * 1000 - float(status.get("writtenAt") or 0) > STATUS_FRESH_MS:
             notify("No Claude session is running the session-ram mod, so the stop can't happen yet. Open a new Claude session.")
         return
+    elif args[0] == "panel":
+        s["autoOpenPanel"] = not s["autoOpenPanel"]
     elif args[0] == "auto":
         s["isAuto"] = not s["isAuto"]
     write_json(SETTINGS, s)
@@ -250,6 +257,7 @@ def render():
     print(f"--Lower by 1 GB | bash={json.dumps(me)} param1=limit param2=-1024 terminal=false refresh=true")
     print(f"Auto: {'on' if s['isAuto'] else 'off'} | bash={json.dumps(me)} param1=auto terminal=false refresh=true")
     print("--While over the limit, stops the turn of the largest working session and flags it. Never archives. | size=11")
+    print(f"Open panel when a session starts: {'on' if s['autoOpenPanel'] else 'off'} | bash={json.dumps(me)} param1=panel terminal=false refresh=true")
     print("Refresh | refresh=true")
 
 
@@ -269,6 +277,17 @@ def selftest():
     assert rows[2][1] == "cccccccc-0000-0000-0000-000000000003", rows[2]
     assert clean("a | b") == "a / b"
     assert parse_limit_mb("8") == 8192 and parse_limit_mb(" 8.5 GB ") == 8704 and parse_limit_mb("2048 mb") == 2048
+    global SETTINGS
+    real, SETTINGS = SETTINGS, os.path.join(os.environ.get("TMPDIR", "/tmp"), f"session-ram-selftest-{os.getpid()}.json")
+    try:
+        write_json(SETTINGS, {"limitMb": 8192, "futureKey": 1})
+        act(["panel"])
+        act(["limit-set", "4096"])
+        saved = read_json(SETTINGS, {})
+        assert saved == {"limitMb": 4096, "isAuto": False, "autoOpenPanel": False, "futureKey": 1}, saved
+    finally:
+        os.remove(SETTINGS)
+        SETTINGS = real
     assert parse_limit_mb("512 MB") is None and parse_limit_mb("lots") is None and parse_limit_mb("") is None
     print("selftest ok")
 

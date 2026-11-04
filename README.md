@@ -20,6 +20,8 @@ Both show every session loaded in memory, largest first, with its RAM (including
 
 **Limit and Auto.** Set a RAM limit (default 6 GB) by typing a value like `8` or `8 GB`, or with the presets. Going over it warns you. With **Auto** on, while you're over the limit it stops the in-progress turn of the largest working session and flags it red, one session every 20 seconds at most. **Auto never archives or closes anything**, and it's off by default. The limit can't hard-cap RAM: it warns and, with Auto, stops turns.
 
+**Panel on start.** The panel opens by itself when a session starts. If you use the menu bar or tray instead, switch off **Open panel when a session starts** in their menu; you can still open the panel with `/session-ram`.
+
 ## Install
 
 ### Step 1: the mod (everyone)

@@ -322,3 +322,31 @@ test('a stop request from the menu bar stops that session; a request for this se
   expect(stopped).toEqual(['local_a'])
   expect(Object.keys(JSON.parse(written[path] ?? '{}'))).toEqual(['local_self'])
 })
+
+test('with autoOpenPanel off, a starting session does not open the panel; /session-ram still does', async ($, on) => {
+  const opened: string[] = []
+  on('command.register', () => ({ value: { command: 'session-ram' } }))
+  on('ui.open', (_, e) => {
+    opened.push(String(e.id))
+    return { value: { isPlaced: true } }
+  })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/Users/x' : undefined }))
+  on('fs.read', (_, e) => {
+    if (String(e.path).endsWith('session-ram-settings.json')) return { value: JSON.stringify({ limitMb: 6144, autoOpenPanel: false }) }
+    throw new Error('ENOENT')
+  })
+  on('fs.write', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+  on('tool.register', () => ({ value: { tool: 'mcp__session-ram__snapshot' } }))
+  on('clock.every', () => ({ value: {} }))
+  on('clock.now', () => ({ value: 0 }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await new Promise(r => setTimeout(r, 50))
+  expect(opened).toEqual([])
+
+  await $.command.run({ command: 'session-ram' })
+  expect(opened).toEqual(['session-ram'])
+})

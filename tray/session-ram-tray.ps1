@@ -47,10 +47,16 @@ function Write-Json([string]$Path, $Value) {
 }
 
 function Get-Settings {
+    # Keeps any keys this script doesn't know, so writing the settings back never drops them.
     $s = Read-Json $SettingsPath
+    $out = @{}
+    if ($s) { foreach ($p in $s.PSObject.Properties) { $out[$p.Name] = $p.Value } }
     $limit = $DefaultLimitMb
     if ($s -and [int]$s.limitMb -gt 0) { $limit = [int]$s.limitMb }
-    return @{ limitMb = $limit; isAuto = [bool]($s -and $s.isAuto -eq $true) }
+    $out['limitMb'] = $limit
+    $out['isAuto'] = [bool]($s -and $s.isAuto -eq $true)
+    $out['autoOpenPanel'] = -not ($s -and $s.autoOpenPanel -eq $false)
+    return $out
 }
 
 function ConvertTo-LimitMb([string]$Text) {
@@ -206,6 +212,12 @@ function Request-Stop([string]$SessionId) {
     Update-Tray
 }
 
+function Switch-PanelAutoOpen {
+    $s = Get-Settings
+    $s['autoOpenPanel'] = -not $s['autoOpenPanel']
+    Write-Json $SettingsPath $s
+}
+
 function Switch-Auto {
     $s = Get-Settings
     $s.isAuto = -not $s.isAuto
@@ -297,6 +309,11 @@ function Build-Menu {
     $auto.add_Click({ Switch-Auto })
     [void]$menu.Items.Add($auto)
 
+    $panelLabel = if ((Get-Settings)['autoOpenPanel']) { 'Open panel when a session starts: on' } else { 'Open panel when a session starts: off' }
+    $panel = New-Object System.Windows.Forms.ToolStripMenuItem $panelLabel
+    $panel.add_Click({ Switch-PanelAutoOpen })
+    [void]$menu.Items.Add($panel)
+
     $refresh = $menu.Items.Add('Refresh')
     $refresh.add_Click({ Update-Tray })
     $exit = $menu.Items.Add('Exit')
@@ -379,6 +396,10 @@ function Invoke-SelfTest {
         Write-Json $StoppedPath @{ local_b = @{ at = $now; mb = 100; title = 'Idle session' } }
         Write-Json $SettingsPath @{ limitMb = 600; isAuto = $false }
         Assert ([System.IO.File]::ReadAllBytes($SettingsPath)[0] -eq [byte][char]'{') 'settings written without a BOM'
+        Write-Json $SettingsPath @{ limitMb = 600; isAuto = $false; futureKey = 1 }
+        Switch-PanelAutoOpen
+        $after = Read-Json $SettingsPath
+        Assert ($after.autoOpenPanel -eq $false -and $after.futureKey -eq 1 -and $after.limitMb -eq 600) 'panel toggle keeps other settings'
         function Get-Procs { $procs }
         function Update-Tray { }
         $script:Meta = $null

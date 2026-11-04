@@ -208,14 +208,15 @@ async function archive($: Engine, row: Row) {
 // the settings either side can change, and the latest snapshot for the menu bar to read.
 const claudeDir = async ($: Engine) =>
   `${(await isWindows($)) ? await $.env.get('USERPROFILE') : await $.env.get('HOME')}/.claude`
-type Settings = { limitMb: number; isAuto: boolean }
+// autoOpenPanel: open the panel when a session starts (off for people who use the menu bar or tray instead).
+type Settings = { limitMb: number; isAuto: boolean; autoOpenPanel: boolean }
 
 async function readSettings($: Engine): Promise<Settings> {
   try {
     const s = JSON.parse(await $.fs.read(`${await claudeDir($)}/session-ram-settings.json`))
-    return { limitMb: Number(s.limitMb) || DEFAULT_LIMIT_MB, isAuto: s.isAuto === true }
+    return { limitMb: Number(s.limitMb) || DEFAULT_LIMIT_MB, isAuto: s.isAuto === true, autoOpenPanel: s.autoOpenPanel !== false }
   } catch {
-    return { limitMb: DEFAULT_LIMIT_MB, isAuto: false }
+    return { limitMb: DEFAULT_LIMIT_MB, isAuto: false, autoOpenPanel: true }
   }
 }
 
@@ -269,7 +270,10 @@ async function readFlags($: Engine): Promise<Flags> {
 
 /** One check at a time per session: the timer, Refresh and a press can overlap, and two overlapping checks would each stop a session. */
 function tick($: Engine): Promise<void> {
-  inFlight ??= runTick($).finally(() => {
+  // A check that fails (the module reloading under it, a file it can't write) is retried by the next one.
+  inFlight ??= runTick($)
+    .catch(() => {})
+    .finally(() => {
     inFlight = undefined
   })
   return inFlight
@@ -383,10 +387,10 @@ export const register: Register = on => {
       name: 'snapshot',
       description: 'Session RAM panel: re-measures and returns the rows it shows (per-session RAM, working/idle) and any error, as JSON.',
     })
-    void $.ui.open({ id: PANE, title: 'Session RAM' })
+    if ((await readSettings($)).autoOpenPanel) void $.ui.open({ id: PANE, title: 'Session RAM' })
     void tick($)
     $.clock.every(TICK_MS, () => tick($))
-    $.clock.every(3_000, () => handleRequests($))
+    $.clock.every(3_000, () => handleRequests($).catch(() => {}))
 
     return started
   })
