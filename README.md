@@ -1,5 +1,9 @@
 # Session RAM
 
+<img src="docs/screenshot.png" alt="The Session RAM panel: total RAM against a 6 GB limit, limit and Auto buttons, then one row per session with its RAM, working or idle status, and a Stop turn or Archive button" width="300">
+
+*The panel, shown with sample sessions.*
+
 A Claude Code mod for the Claude desktop app on macOS. It opens a **Session RAM** panel beside each Code session and shows:
 
 - every Claude Code session currently loaded in memory, largest first
