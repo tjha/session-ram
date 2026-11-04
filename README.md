@@ -20,13 +20,15 @@ macOS cannot hard-cap a process's RAM, so the limit is a warning plus optional a
 At the prompt of a terminal session:
 
 ```
-/plugin install session-ram --marketplace tjha/session-ram
+/plugin marketplace add tjha/session-ram
+/plugin install session-ram@session-ram
 ```
 
 From a shell:
 
 ```bash
-claude plugin install session-ram --marketplace tjha/session-ram
+claude plugin marketplace add tjha/session-ram
+claude plugin install session-ram@session-ram
 ```
 
 In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `tjha/session-ram`, then Add plugin.
