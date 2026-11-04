@@ -38,11 +38,15 @@ test('lists each session with its process-tree RAM and status, and flags the lim
   on('command.register', () => ({ value: { command: 'session-ram' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('process.run', () => ({ value: { exitCode: 0, stdout: PS, stderr: '' } }))
+  // The second listing reads the environment of sessions no file maps (pid 301, started fresh).
+  on('process.run', (_, e) => {
+    const stdout = e.argv.includes('-wwE') ? ` 301 ${CLAUDE} PATH=/bin CLAUDE_CODE_HOST_SESSION_ID=local_fresh HOME=/Users/x` : PS
+    return { value: { exitCode: 0, stdout, stderr: '' } }
+  })
   const CLI: Record<string, string> = {
     local_a: 'aaaaaaaa-0000-0000-0000-000000000001',
     local_b: 'bbbbbbbb-0000-0000-0000-000000000002',
-    local_self: 'cccccccc-0000-0000-0000-000000000003',
+    local_fresh: '',
   }
   on('env.get', () => ({ value: '/Users/x' }))
   const ls = (files: string[]) => (_: unknown, e: { path?: string }) => {
@@ -52,7 +56,13 @@ test('lists each session with its process-tree RAM and status, and flags the lim
     return { value: files.map(name => ({ name, kind: 'file' })) }
   }
   on('fs.list', ls(Object.keys(CLI).map(id => `${id}.json`)))
+  const written: Record<string, string> = {}
+  on('fs.write', (_, e) => {
+    written[String(e.path)] = String(e.text)
+    return { value: undefined }
+  })
   on('fs.read', (_, e) => {
+    if (String(e.path).endsWith('session-ram-settings.json')) return { value: JSON.stringify({ limitMb: 600 }) }
     const id = /(local_\w+)\.json$/.exec(String(e.path))?.[1] ?? ''
     return { value: JSON.stringify({ sessionId: id, title: `file title ${id}`, cliSessionId: CLI[id] }) }
   })
@@ -72,10 +82,14 @@ test('lists each session with its process-tree RAM and status, and flags the lim
   expect((await ui.find({ type: 'Text', text: /700 MB/ }))?.text).toContain('● working')
   expect((await ui.find({ type: 'Text', text: /100 MB/ }))?.text).toContain('○ idle')
   expect(await ui.find({ type: 'Text', text: /^Idle session$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /This session/ })).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /^This session/ }))?.text).toBe('This session: file title local_fresh')
   expect(await ui.find({ key: 'act-101' })).toBeDefined()
   expect(await ui.find({ key: 'act-301' })).toBeUndefined()
   expect((await ui.find({ type: 'Text', text: /sessions in memory/ }))?.text).toBe('3 sessions in memory, 2 working')
+  // The snapshot the menu-bar script reads.
+  const status = JSON.parse(written['/Users/x/.claude/session-ram-status.json'] ?? '{}')
+  expect(status.limitMb).toBe(600)
+  expect(status.rows.find((r: { sessionId: string }) => r.sessionId === 'local_b').isWorking).toBe(false)
   await ui.unmount()
 
   // A narrow pane wraps the controls instead of clipping them.
@@ -101,6 +115,7 @@ test('when the app session list fails, rows keep file titles and show the error'
   on('fs.read', () => ({ value: JSON.stringify({ sessionId: 'local_b', title: 'From file', cliSessionId: 'bbbbbbbb-0000-0000-0000-000000000002' }) }))
   on('mcp.call', () => ({ value: { content: [{ type: 'text', text: 'Error: not allowed' }], isError: false } }))
   on('store.get', () => ({ value: undefined }))
+  on('fs.write', () => ({ value: undefined }))
   on('tool.register', () => ({ value: { tool: 'mcp__session-ram__snapshot' } }))
   on('clock.every', () => ({ value: {} }))
   on('clock.now', () => ({ value: 0 }))
@@ -158,6 +173,7 @@ test('Windows: lists sessions from the PowerShell process query and %APPDATA% se
   })
   on('mcp.call', (_, e) => text(LISTED.find(s => s.sessionId === (e.args as { session_id?: string })?.session_id)))
   on('store.get', () => ({ value: undefined }))
+  on('fs.write', () => ({ value: undefined }))
   on('store.set', () => ({ value: undefined }))
   on('tool.register', () => ({ value: { tool: 'mcp__session-ram__snapshot' } }))
   on('clock.every', () => ({ value: {} }))
@@ -178,4 +194,131 @@ test('Windows: lists sessions from the PowerShell process query and %APPDATA% se
   expect(await ui.find({ type: 'Text', text: /This session/ })).toBeDefined()
   expect((await ui.find({ type: 'Text', text: /sessions in memory/ }))?.text).toBe('3 sessions in memory, 2 working')
   await ui.unmount()
+})
+
+test('Auto over the limit stops the largest working session and flags it, never archives', async ($, on) => {
+  const CLI: Record<string, string> = {
+    local_a: 'aaaaaaaa-0000-0000-0000-000000000001',
+    local_b: 'bbbbbbbb-0000-0000-0000-000000000002',
+  }
+  const LISTED = [
+    { sessionId: 'local_a', title: 'Busy lint session', isRunning: true },
+    { sessionId: 'local_b', title: 'Idle session', isRunning: false },
+  ]
+  const calls: string[] = []
+  const written: Record<string, string> = {}
+  on('command.register', () => ({ value: { command: 'session-ram' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/Users/x' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: PS, stderr: '' } }))
+  on('fs.list', (_, e) => {
+    const path = String(e.path)
+    if (path.endsWith('claude-code-sessions')) return { value: [{ name: 'org1', kind: 'dir' }] }
+    if (path.endsWith('/org1')) return { value: [{ name: 'acct1', kind: 'dir' }] }
+    return { value: Object.keys(CLI).map(id => ({ name: `${id}.json`, kind: 'file' })) }
+  })
+  on('fs.read', (_, e) => {
+    const path = String(e.path)
+    if (path.endsWith('session-ram-settings.json')) return { value: JSON.stringify({ limitMb: 600, isAuto: true }) }
+    if (path.endsWith('session-ram-stopped.json')) return { value: written[path] ?? '{}' }
+    const id = /(local_\w+)\.json$/.exec(path)?.[1] ?? ''
+    return { value: JSON.stringify({ sessionId: id, title: id, cliSessionId: CLI[id] }) }
+  })
+  on('fs.write', (_, e) => {
+    written[String(e.path)] = String(e.text)
+    return { value: undefined }
+  })
+  on('mcp.call', (_, e) => {
+    calls.push(String(e.tool))
+    if (e.tool === 'get_session') return text(LISTED.find(s => s.sessionId === (e.args as { session_id?: string })?.session_id))
+    return text({ ok: true })
+  })
+  on('tool.register', () => ({ value: { tool: 'mcp__session-ram__snapshot' } }))
+  on('clock.every', () => ({ value: {} }))
+  on('clock.now', () => ({ value: 1_000_000 }))
+  on('ui.toast', () => ({ value: undefined }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await new Promise(r => setTimeout(r, 50))
+
+  expect(calls.filter(t => t === 'stop_session').length).toBe(1)
+  expect(calls.includes('archive_session')).toBe(false)
+  expect(Object.keys(JSON.parse(written['/Users/x/.claude/session-ram-stopped.json'] ?? '{}'))).toEqual(['local_a'])
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /700 MB/ }))?.text).toContain('⚠ stopped (over limit)')
+  expect(await ui.find({ type: 'Text', text: /1 stopped for going over the limit/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a typed limit sets the exact value; a bad one is refused', async ($, on) => {
+  const written: Record<string, string> = {}
+  const toasts: string[] = []
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/Users/x' : undefined }))
+  on('fs.read', (_, e) => {
+    const path = String(e.path)
+    if (path in written) return { value: written[path] ?? '' }
+    throw new Error('ENOENT')
+  })
+  on('fs.write', (_, e) => {
+    written[String(e.path)] = String(e.text)
+    return { value: undefined }
+  })
+  on('ui.toast', (_, e) => {
+    toasts.push(String(e.text))
+    return { value: undefined }
+  })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.input({ key: 'limit', text: '8 GB' })
+  expect(JSON.parse(written['/Users/x/.claude/session-ram-settings.json'] ?? '{}').limitMb).toBe(8192)
+  await ui.input({ key: 'limit', text: '2048 MB' })
+  expect(JSON.parse(written['/Users/x/.claude/session-ram-settings.json'] ?? '{}').limitMb).toBe(2048)
+  await ui.input({ key: 'limit', text: 'lots' })
+  expect(JSON.parse(written['/Users/x/.claude/session-ram-settings.json'] ?? '{}').limitMb).toBe(2048)
+  expect(toasts.some(t => t.includes('at least 1 GB'))).toBe(true)
+  await ui.unmount()
+
+  // Mobile has no text field; the +/- buttons stay.
+  const phone = await $.ui.mount({ ...PANE, surface: 'mobile' })
+  expect(await phone.find({ key: 'limit' })).toBeUndefined()
+  expect(await phone.find({ key: 'up' })).toBeDefined()
+  await phone.unmount()
+})
+
+test('a stop request from the menu bar stops that session; a request for this session is left for others', async ($, on) => {
+  const path = '/Users/x/.claude/session-ram-requests.json'
+  const written: Record<string, string> = {
+    [path]: JSON.stringify({ local_a: { action: 'stop', at: 1_000_000 }, local_self: { action: 'stop', at: 1_000_000 } }),
+  }
+  const stopped: string[] = []
+  on('command.register', () => ({ value: { command: 'session-ram' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/Users/x' : e.name === 'CLAUDE_CODE_HOST_SESSION_ID' ? 'local_self' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', (_, e) => {
+    const p = String(e.path)
+    if (p in written) return { value: written[p] ?? '' }
+    throw new Error('ENOENT')
+  })
+  on('fs.write', (_, e) => {
+    written[String(e.path)] = String(e.text)
+    return { value: undefined }
+  })
+  on('mcp.call', (_, e) => {
+    if (e.tool === 'stop_session') stopped.push(String((e.args as { session_id?: string })?.session_id))
+    return text({ ok: true })
+  })
+  on('tool.register', () => ({ value: { tool: 'mcp__session-ram__snapshot' } }))
+  on('clock.every', () => ({ value: {} }))
+  on('clock.now', () => ({ value: 1_010_000 }))
+  on('ui.toast', () => ({ value: undefined }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await new Promise(r => setTimeout(r, 50))
+
+  expect(stopped).toEqual(['local_a'])
+  expect(Object.keys(JSON.parse(written[path] ?? '{}'))).toEqual(['local_self'])
 })

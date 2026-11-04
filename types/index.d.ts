@@ -8,6 +8,8 @@ export type Row = {
   /** null when the app did not say. */
   isWorking: boolean | null
   isSelf: boolean
+  /** Auto stopped this session's turn for going over the limit; cleared once it is resumed. */
+  isFlagged: boolean
 }
 
 export type View = {

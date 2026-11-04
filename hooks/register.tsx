@@ -11,12 +11,13 @@ const SESSIONS_ROOT = 'Library/Application Support/Claude/claude-code-sessions'
 const SESSIONS_ROOT_WIN = 'Claude/claude-code-sessions'
 const TICK_MS = 15_000
 const DEFAULT_LIMIT_MB = 6144
-const SKIP_MS = 10 * 60_000
+// After Auto stops a turn, give its RAM time to drop before stopping another.
+const STOP_GAP_MS = 20_000
 
 const view = atom(
   { plugin: 'session-ram', key: 'view' } as const,
   { rows: [], totalMb: 0, limitMb: DEFAULT_LIMIT_MB, isAuto: false, note: 'Measuring…' },
-  { shape: 'view-1' },
+  { shape: 'view-2' },
 )
 
 type Proc = { pid: number; ppid: number; kb: number; cmd: string }
@@ -24,8 +25,9 @@ type Listed = { sessionId: string; title: string; isRunning: boolean }
 
 // Module state: lost on reload, which only costs a re-read.
 const cliToMeta = new Map<string, { sessionId: string; title: string }>()
-const skipUntil = new Map<string, number>()
+const titleById = new Map<string, string>()
 let wasOver = false
+let inFlight: Promise<void> | undefined
 
 const errText = (err: unknown) => String(err).slice(0, 300)
 
@@ -127,6 +129,7 @@ async function scanSessionFiles($: Engine) {
   for (const file of files) {
     try {
       const meta = JSON.parse(await $.fs.read(file))
+      if (typeof meta.sessionId === 'string') titleById.set(meta.sessionId, meta.title ?? meta.sessionId)
       for (const id of [meta.cliSessionId, meta.lastAssistantCliSessionId]) {
         if (typeof id === 'string') cliToMeta.set(id, { sessionId: meta.sessionId, title: meta.title ?? meta.sessionId })
       }
@@ -140,11 +143,25 @@ async function measure($: Engine): Promise<{ rows: Row[]; note: string }> {
   const win = await isWindows($)
   const listing = await $.process.run(win ? WIN_ARGV : PS_ARGV)
   const { roots, selfPid } = sessionProcs(win ? parseWin(listing.stdout) : parsePs(listing.stdout))
-  if (roots.some(p => p.cli && !cliToMeta.has(p.cli))) await scanSessionFiles($)
+  // A session started fresh in this app run has no --resume id; on macOS its environment names it.
+  // shortcut: Windows can't read another process's environment, so fresh sessions there show as unknown until resumed.
+  const hostIds = new Map<number, string>()
+  const unnamed = roots.filter(p => !(p.cli && cliToMeta.has(p.cli)))
+  if (!win && unnamed.length > 0) {
+    const env = await $.process.run(['ps', '-wwE', '-o', 'pid=,command=', '-p', unnamed.map(p => p.pid).join(',')])
+    for (const line of env.stdout.split('\n')) {
+      const m = /^\s*(\d+)\s.*\bCLAUDE_CODE_HOST_SESSION_ID=(local_[\w-]+)/.exec(line)
+      if (m) hostIds.set(Number(m[1]), m[2] ?? '')
+    }
+  }
+  const sessionIdOf = (p: { pid: number; cli?: string }) => hostIds.get(p.pid) ?? (p.cli ? cliToMeta.get(p.cli)?.sessionId : undefined)
+  if (roots.some(p => (p.cli && !cliToMeta.has(p.cli)) || (hostIds.has(p.pid) && !titleById.has(hostIds.get(p.pid)!)))) {
+    await scanSessionFiles($)
+  }
   // One small get_session per loaded session: a full list_sessions overflows the tool-result limit.
   const listed = new Map<string, Listed>()
   let note = ''
-  const ids = roots.flatMap(p => (p.pid !== selfPid && p.cli && cliToMeta.get(p.cli)?.sessionId) || [])
+  const ids = roots.flatMap(p => sessionIdOf(p) || [])
   await Promise.all(
     ids.map(async id => {
       try {
@@ -157,17 +174,20 @@ async function measure($: Engine): Promise<{ rows: Row[]; note: string }> {
 
   const rows = roots
     .map(p => {
-      const meta = p.cli ? cliToMeta.get(p.cli) : undefined
-      const s = meta ? listed.get(meta.sessionId) : undefined
+      const sid = sessionIdOf(p)
+      const s = sid ? listed.get(sid) : undefined
       const isSelf = p.pid === selfPid
+      const name = s?.title ?? (sid ? titleById.get(sid) : undefined)
       return {
         pid: p.pid,
-        sessionId: meta?.sessionId ?? null,
-        title: isSelf ? 'This session (RAM panel)' : (s?.title ?? meta?.title ?? `Unknown session (pid ${p.pid})`),
+        sessionId: sid ?? null,
+        title: isSelf ? `This session${name ? `: ${name}` : ''}` : (name ?? `Unknown session (pid ${p.pid})`),
         mb: Math.round((p.kb + p.childKb) / 1024),
         childMb: Math.round(p.childKb / 1024),
-        isWorking: isSelf ? true : s ? s.isRunning : null,
+        // This session asks about itself too: an idle session running the mod is not working.
+        isWorking: s ? s.isRunning : isSelf ? true : null,
         isSelf,
+        isFlagged: false,
       }
     })
     .sort((a, b) => b.mb - a.mb)
@@ -176,7 +196,6 @@ async function measure($: Engine): Promise<{ rows: Row[]; note: string }> {
 }
 
 async function archive($: Engine, row: Row) {
-  skipUntil.set(row.sessionId!, (await $.clock.now()) + SKIP_MS)
   try {
     await mgmt($, 'archive_session', { session_id: row.sessionId, reason: `Free ${row.mb} MB of RAM` })
     return `Archived "${row.title}" (${row.mb} MB).`
@@ -185,9 +204,79 @@ async function archive($: Engine, row: Row) {
   }
 }
 
-async function tick($: Engine) {
-  const limitMb = Number((await $.store.get('limitMb')) ?? DEFAULT_LIMIT_MB)
-  const isAuto = (await $.store.get('isAuto')) === true
+// Files shared with every session and with the macOS menu-bar script (menubar/):
+// the settings either side can change, and the latest snapshot for the menu bar to read.
+const claudeDir = async ($: Engine) =>
+  `${(await isWindows($)) ? await $.env.get('USERPROFILE') : await $.env.get('HOME')}/.claude`
+type Settings = { limitMb: number; isAuto: boolean }
+
+async function readSettings($: Engine): Promise<Settings> {
+  try {
+    const s = JSON.parse(await $.fs.read(`${await claudeDir($)}/session-ram-settings.json`))
+    return { limitMb: Number(s.limitMb) || DEFAULT_LIMIT_MB, isAuto: s.isAuto === true }
+  } catch {
+    return { limitMb: DEFAULT_LIMIT_MB, isAuto: false }
+  }
+}
+
+async function writeSettings($: Engine, s: Settings) {
+  await $.fs.write(`${await claudeDir($)}/session-ram-settings.json`, JSON.stringify(s))
+}
+
+/** Sessions Auto stopped for going over the limit, by session id: shared so every session and the menu bar highlight them. */
+type Flags = Record<string, { at: number; mb: number; title: string }>
+
+/**
+ * Stop requests from the menu bar or tray, which can't reach the app's session tools: any session
+ * running this mod carries them out. A session can't stop its own turn, so it leaves requests for
+ * itself to the others.
+ * shortcut: two writers can race and drop a request made in the same instant; clicking Stop again re-sends it.
+ */
+async function handleRequests($: Engine) {
+  const path = `${await claudeDir($)}/session-ram-requests.json`
+  let requests: Record<string, { action: string; at: number }>
+  try {
+    requests = JSON.parse(await $.fs.read(path))
+  } catch {
+    return
+  }
+  const selfId = await $.env.get('CLAUDE_CODE_HOST_SESSION_ID')
+  const mine = Object.entries(requests).filter(([id]) => id !== selfId)
+  if (mine.length === 0) return
+  const rest = Object.fromEntries(Object.entries(requests).filter(([id]) => id === selfId))
+  await $.fs.write(path, JSON.stringify(rest))
+  const now = await $.clock.now()
+  for (const [id, r] of mine) {
+    if (r.action !== 'stop' || now - r.at > 120_000) continue
+    const title = titleById.get(id) ?? id
+    try {
+      await mgmt($, 'stop_session', { session_id: id })
+      $.ui.toast(`Stopped the turn in "${title}" (asked from the menu bar).`)
+    } catch (err) {
+      $.ui.toast(`Could not stop "${title}": ${errText(err)}`)
+    }
+  }
+  await tick($)
+}
+
+async function readFlags($: Engine): Promise<Flags> {
+  try {
+    return JSON.parse(await $.fs.read(`${await claudeDir($)}/session-ram-stopped.json`))
+  } catch {
+    return {}
+  }
+}
+
+/** One check at a time per session: the timer, Refresh and a press can overlap, and two overlapping checks would each stop a session. */
+function tick($: Engine): Promise<void> {
+  inFlight ??= runTick($).finally(() => {
+    inFlight = undefined
+  })
+  return inFlight
+}
+
+async function runTick($: Engine) {
+  const { limitMb, isAuto } = await readSettings($)
   let rows: Row[] = []
   let note = ''
   try {
@@ -196,14 +285,32 @@ async function tick($: Engine) {
     note = `Could not measure: ${errText(err)}`
   }
   const totalMb = rows.reduce((sum, r) => sum + r.mb, 0)
+  const now = await $.clock.now()
+  const flags = await readFlags($)
+  const before = JSON.stringify(flags)
+  for (const [id, f] of Object.entries(flags)) {
+    const row = rows.find(r => r.sessionId === id)
+    // Gone (archived or closed), or working again a minute after the stop: the person resumed it.
+    if (!row || (row.isWorking && now - f.at > 60_000)) delete flags[id]
+  }
   if (rows.length > 0 && totalMb > limitMb) {
-    const now = await $.clock.now()
-    // Largest idle session first; working sessions and this one are never archived.
-    const victim = isAuto
-      ? rows.find(r => r.isWorking === false && !r.isSelf && r.sessionId && (skipUntil.get(r.sessionId) ?? 0) < now)
+    // Auto never archives: it stops the in-flight turn of the largest working session (its lint,
+    // tsc and other child processes end with it) and flags it for the person to look at.
+    const target = isAuto
+      ? rows.find(r => r.isWorking && !r.isSelf && r.sessionId && !flags[r.sessionId])
       : undefined
-    if (victim) {
-      note = await archive($, victim)
+    const isRecent = Object.values(flags).some(f => now - f.at < STOP_GAP_MS)
+    if (target && !isRecent) {
+      // Record the flag before stopping, so other sessions running this check see it and hold off.
+      flags[target.sessionId!] = { at: now, mb: target.mb, title: target.title }
+      await $.fs.write(`${await claudeDir($)}/session-ram-stopped.json`, JSON.stringify(flags)).catch(() => {})
+      try {
+        await mgmt($, 'stop_session', { session_id: target.sessionId })
+        note = `Stopped "${target.title}" (${target.mb} MB): sessions were over the ${gb(limitMb)} limit.`
+      } catch (err) {
+        delete flags[target.sessionId!]
+        note = `Could not stop "${target.title}": ${errText(err)}`
+      }
       $.ui.toast(note)
     } else if (!wasOver) {
       $.ui.toast(`Sessions use ${gb(totalMb)}, over your ${gb(limitMb)} limit.`)
@@ -212,20 +319,45 @@ async function tick($: Engine) {
   } else {
     wasOver = false
   }
+  if (JSON.stringify(flags) !== before) {
+    await $.fs.write(`${await claudeDir($)}/session-ram-stopped.json`, JSON.stringify(flags)).catch(() => {})
+  }
+  rows = rows.map(r => ({ ...r, isFlagged: !!(r.sessionId && flags[r.sessionId]) }))
   await update($, view, () => ({ rows, totalMb, limitMb, isAuto, note }))
+  if (rows.length > 0) {
+    const status = { writtenAt: now, rows, totalMb, limitMb, isAuto }
+    await $.fs.write(`${await claudeDir($)}/session-ram-status.json`, JSON.stringify(status)).catch(() => {})
+  }
 }
 
-async function setLimit($: Engine, deltaMb: number) {
-  const cur = Number((await $.store.get('limitMb')) ?? DEFAULT_LIMIT_MB)
-  const limitMb = Math.max(1024, cur + deltaMb)
-  await $.store.set('limitMb', limitMb)
+/** A typed limit: "8", "8 GB", "8.5g" or "8192 MB" (a bare number is GB); at least 1 GB. */
+export function parseLimitMb(text: string): number | undefined {
+  const m = /^\s*(\d+(?:\.\d+)?)\s*(gb?|mb?)?\s*$/i.exec(text)
+  if (!m) return undefined
+  const mb = (m[2] ?? 'g').toLowerCase().startsWith('m') ? Number(m[1]) : Number(m[1]) * 1024
+  return mb >= 1024 ? Math.round(mb) : undefined
+}
+
+async function setLimitTo($: Engine, limitMb: number) {
+  const s = await readSettings($)
+  await writeSettings($, { ...s, limitMb })
   await update($, view, v => ({ ...v, limitMb }))
 }
 
+async function setLimit($: Engine, deltaMb: number) {
+  await setLimitTo($, Math.max(1024, (await readSettings($)).limitMb + deltaMb))
+}
+
+async function setLimitText($: Engine, text: string) {
+  const limitMb = parseLimitMb(text)
+  if (limitMb === undefined) $.ui.toast('Type a limit like 8 or 8 GB (at least 1 GB).')
+  else await setLimitTo($, limitMb)
+}
+
 async function toggleAuto($: Engine) {
-  const isAuto = (await $.store.get('isAuto')) !== true
-  await $.store.set('isAuto', isAuto)
-  await update($, view, v => ({ ...v, isAuto }))
+  const s = await readSettings($)
+  await writeSettings($, { ...s, isAuto: !s.isAuto })
+  await update($, view, v => ({ ...v, isAuto: !s.isAuto }))
   await tick($)
 }
 
@@ -254,6 +386,7 @@ export const register: Register = on => {
     void $.ui.open({ id: PANE, title: 'Session RAM' })
     void tick($)
     $.clock.every(TICK_MS, () => tick($))
+    $.clock.every(3_000, () => handleRequests($))
 
     return started
   })
@@ -276,6 +409,7 @@ export const register: Register = on => {
     const v: View = await read($, view)
     const isOver = v.totalMb > v.limitMb
     const working = v.rows.filter(r => r.isWorking).length
+    const flagged = v.rows.filter(r => r.isFlagged).length
 
     return (
       <Box flexDirection="column">
@@ -285,17 +419,27 @@ export const register: Register = on => {
         <Text dimColor>
           {v.rows.length} sessions in memory, {working} working
         </Text>
+        {flagged > 0 && (
+          <Text bold color="error">
+            ⚠ {flagged} stopped for going over the limit. Check them before resuming.
+          </Text>
+        )}
         <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap={1}>
           <Button key="down" label="− 1 GB" onPress={() => void setLimit($, -1024)} />
           <Button key="up" label="+ 1 GB" onPress={() => void setLimit($, 1024)} />
           <Button key="auto" label={v.isAuto ? 'Auto: on' : 'Auto: off'} onPress={() => void toggleAuto($)} />
           <Button key="refresh" label="Refresh" onPress={() => void tick($)} />
         </Box>
-        <Text dimColor>Auto: archive the largest idle session while over the limit.</Text>
+        {e.surface !== 'mobile' &&
+          (() => {
+            const { Input } = $.ui.resolve(e)
+            return <Input key="limit" placeholder="Set limit, e.g. 8 GB" submitLabel="Set" onSubmit={text => void setLimitText($, text)} />
+          })()}
+        <Text dimColor>Auto: while over the limit, stop the turn of the largest working session and flag it. Never archives.</Text>
         {v.rows.map(r => (
           <Box flexDirection="column">
-            <Text bold color={r.isWorking ? 'success' : undefined}>
-              {r.isWorking ? '● working' : r.isWorking === false ? '○ idle' : '? unknown'} · {r.mb} MB
+            <Text bold color={r.isFlagged ? 'error' : r.isWorking ? 'success' : undefined}>
+              {r.isFlagged ? '⚠ stopped (over limit)' : r.isWorking ? '● working' : r.isWorking === false ? '○ idle' : '? unknown'} · {r.mb} MB
               {r.childMb > 0 ? ` (${r.childMb} MB child processes)` : ''}
             </Text>
             <Text dimColor={r.isWorking === false}>{r.title}</Text>
