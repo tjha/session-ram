@@ -1,81 +1,114 @@
 # Session RAM
 
-<img src="docs/screenshot.png" alt="The Session RAM panel: total RAM against a 6 GB limit, limit and Auto buttons, then one row per session with its RAM, working or idle status, and a Stop turn or Archive button" width="300">
+<img src="docs/screenshot.png" alt="The Session RAM panel: total RAM against a 6 GB limit, a box to type the limit, the Auto switch, then one row per session with its RAM and whether it is working, idle or stopped for going over the limit" width="300"> <img src="docs/menubar.png" alt="The Session RAM menu-bar menu on macOS: total RAM against the limit, then each session with its RAM, colored by status, and the Limit and Auto items" width="360">
 
-*The panel, shown with sample sessions.*
+*The panel inside a Claude session (left) and the macOS menu bar (right), shown with sample sessions.*
 
-A Claude Code mod for the Claude desktop app on macOS and Windows. It opens a **Session RAM** panel beside each Code session and shows:
+See how much RAM each Claude Code session in the Claude desktop app is using, which ones are working, and stop the ones that run away, on macOS and Windows.
 
-- every Claude Code session currently loaded in memory, largest first
-- how much RAM each one uses, counting its child processes (lint, tsc, dev servers)
-- whether it is **working** or **idle**
-- a **Stop turn** button for working sessions and an **Archive** button for idle ones
+- **Panel:** beside each Code session in the Claude desktop app.
+- **Menu bar (macOS) or tray icon (Windows):** always visible, whichever session you're in. Optional.
 
-It also has a RAM limit (default 6 GB). Type an exact value such as `8` or `8 GB` in the panel, or use **− 1 GB / + 1 GB**. Going over the limit shows a toast. With **Auto** on, while usage is over the limit it stops the in-progress turn of the largest working session (ending its lint, tsc and other child processes) and flags it in red as **⚠ stopped (over limit)**, so you can look into it before resuming or starting new sessions. The flag clears once you resume that session. Auto never archives anything, and it's off by default.
+Both show every session loaded in memory, largest first, with its RAM (including the lint, tsc and dev-server processes it started) and its status:
 
-The mod cannot hard-cap a process's RAM, so the limit is a warning plus optional archiving, not a hard cap.
+| Mark | Color | Meaning |
+| --- | --- | --- |
+| ● | green | **Working**: a turn is in progress. Has a **Stop turn** button. |
+| ○ | white | **Idle**: loaded and waiting for you. Its RAM is the conversation it holds in memory. |
+| ⚠ | red | **Stopped (over limit)**: Auto stopped its turn. Look into it before resuming; the flag clears once you resume it. |
+| · | gray | **Unknown**: no session running the mod has reported in the last minute (see Troubleshooting). |
+
+**Limit and Auto.** Set a RAM limit (default 6 GB) by typing a value like `8` or `8 GB`, or with the presets. Going over it warns you. With **Auto** on, while you're over the limit it stops the in-progress turn of the largest working session and flags it red, one session every 20 seconds at most. **Auto never archives or closes anything**, and it's off by default. The limit can't hard-cap RAM: it warns and, with Auto, stops turns.
 
 ## Install
 
-At the prompt of a terminal session:
+### Step 1: the mod (everyone)
 
-```
-/plugin marketplace add tjha/session-ram
-/plugin install session-ram@session-ram
-```
+1. Open the Claude desktop app and any Code session.
+2. Click **+** next to the prompt box, then **Plugins**.
+3. Choose **Add marketplace** and enter `tjha/session-ram`.
+4. Find **session-ram** in the list and choose **Add plugin**.
+5. Quit Claude completely and reopen it, so every session loads the mod (each session loads it only when it starts):
+   - macOS: press ⌘Q (closing the window isn't enough).
+   - Windows: right-click the Claude icon by the clock and choose **Quit**.
 
-From a shell:
+**You should see** the **Session RAM** panel beside your Code session. If you close it, type `/session-ram` to bring it back.
+
+Prefer a terminal? These two commands do steps 2–4:
 
 ```bash
 claude plugin marketplace add tjha/session-ram
 claude plugin install session-ram@session-ram
 ```
 
-In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `tjha/session-ram`, then Add plugin.
+### Step 2 (optional): menu bar on macOS
 
-Installed at the user scope, the mod loads in every Code session the desktop app starts. Type `/session-ram` to reopen the panel after closing it.
+Needs [Homebrew](https://brew.sh). Run these in Terminal, one after another:
 
-## Menu bar (macOS)
+1. Install [SwiftBar](https://swiftbar.app), the free app that shows the menu:
 
-`menubar/session-ram.15s.py` shows the same information in the macOS menu bar, whichever session you're in: total RAM (red when over the limit or when Auto stopped something), and each loaded session with its RAM and status. Each session opens in Claude from its submenu, and a working one has **Stop turn**. The menu also sets the limit (type a value with **Set limit…**, or pick 4–16 GB) and the Auto switch. It needs [SwiftBar](https://swiftbar.app):
+   ```bash
+   brew install --cask swiftbar
+   ```
 
-```bash
-brew install --cask swiftbar
-```
+2. Download the menu-bar script:
 
-```bash
-mkdir -p ~/SwiftBarPlugins && curl -fsSL -o ~/SwiftBarPlugins/session-ram.15s.py https://raw.githubusercontent.com/tjha/session-ram/main/menubar/session-ram.15s.py && chmod +x ~/SwiftBarPlugins/session-ram.15s.py
-```
+   ```bash
+   mkdir -p ~/SwiftBarPlugins && curl -fsSL -o ~/SwiftBarPlugins/session-ram.15s.py https://raw.githubusercontent.com/tjha/session-ram/main/menubar/session-ram.15s.py && chmod +x ~/SwiftBarPlugins/session-ram.15s.py
+   ```
 
-Then open SwiftBar and choose `~/SwiftBarPlugins` as its plugin folder.
+3. Point SwiftBar at it and start SwiftBar:
 
-## Tray icon (Windows)
+   ```bash
+   defaults write com.ameba.SwiftBar PluginDirectory -string "$HOME/SwiftBarPlugins" && open -a SwiftBar
+   ```
 
-`tray/session-ram-tray.ps1` is the same thing as an icon in the Windows notification area, by the clock. It needs only the Windows PowerShell that comes with Windows. Click the icon for the session list, the limit and Auto. Run this in PowerShell:
+4. To start it when you log in:
 
-```powershell
-$dir = "$env:USERPROFILE\SessionRam"; New-Item -ItemType Directory -Force $dir | Out-Null
-Invoke-WebRequest https://raw.githubusercontent.com/tjha/session-ram/main/tray/session-ram-tray.ps1 -OutFile "$dir\session-ram-tray.ps1"
-Start-Process powershell -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',"$dir\session-ram-tray.ps1"
-```
+   ```bash
+   osascript -e 'tell application "System Events" to make login item at end with properties {path:"/Applications/SwiftBar.app", hidden:true}'
+   ```
 
-To start it when you sign in to Windows:
+**You should see** a memory-chip icon with your total RAM in the menu bar. Click it for the list. Each session's submenu has **Open in Claude** and, while it's working, **Stop turn**. **Limit** has **Set limit…** and presets from 4 to 16 GB. If SwiftBar shows a welcome window the first time, click through it.
 
-```powershell
-$s = (New-Object -ComObject WScript.Shell).CreateShortcut("$([Environment]::GetFolderPath('Startup'))\Session RAM.lnk")
-$s.TargetPath = 'powershell.exe'; $s.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$env:USERPROFILE\SessionRam\session-ram-tray.ps1`""; $s.Save()
-```
+### Step 2 (optional): tray icon on Windows
 
-The tray script is checked with its self-test (`-SelfTest`) under PowerShell 7 on macOS, not yet on Windows.
+Uses the PowerShell that comes with Windows. Open **PowerShell** (not as administrator) and run:
 
-## How the menu bar and tray talk to Claude
+1. Download the tray script and start it:
 
-Both measure RAM themselves. Working/idle status, Auto and **Stop turn** need at least one Claude session running the mod: the menu bar and tray can't reach the app's session controls, so they leave a stop request in `~/.claude/session-ram-requests.json` and the mod in any running session carries it out within about 3 seconds. A session can't stop its own turn, so stopping the only session running the mod needs another one open.
+   ```powershell
+   $dir = "$env:USERPROFILE\SessionRam"; New-Item -ItemType Directory -Force $dir | Out-Null
+   Invoke-WebRequest https://raw.githubusercontent.com/tjha/session-ram/main/tray/session-ram-tray.ps1 -OutFile "$dir\session-ram-tray.ps1"
+   Start-Process powershell -ArgumentList '-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File',"$dir\session-ram-tray.ps1"
+   ```
 
-## Notes
+2. To start it when you sign in to Windows:
 
-- Refreshes every 15 seconds. Each session with the mod runs its own refresh: one process listing (`ps` on macOS, a PowerShell `Get-CimInstance Win32_Process` query on Windows) plus one lookup per loaded session.
-- Archiving a session stops its process and, by default, removes its worktree; the app keeps a worktree with uncommitted changes. Archived sessions can be restored from the Archived list.
-- The limit and the Auto setting are shared by all sessions, the menu bar and the tray, through `~/.claude/session-ram-settings.json`. The mod also writes its latest snapshot to `~/.claude/session-ram-status.json` and the sessions Auto stopped to `~/.claude/session-ram-stopped.json`.
-- Session names come from the desktop app's files under `~/Library/Application Support/Claude/claude-code-sessions` (macOS) or `%APPDATA%\Claude\claude-code-sessions` (Windows); working/idle status and the buttons use the app's own session tools, so they work only inside the desktop app.
-- Windows support is checked with sample data only, not yet on a Windows machine. If the panel says "Could not measure" there, please open an issue with that line.
+   ```powershell
+   $s = (New-Object -ComObject WScript.Shell).CreateShortcut("$([Environment]::GetFolderPath('Startup'))\Session RAM.lnk")
+   $s.TargetPath = 'powershell.exe'; $s.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$env:USERPROFILE\SessionRam\session-ram-tray.ps1`""; $s.Save()
+   ```
+
+**You should see** a new icon by the clock (it may be under the **^** arrow; drag it out to keep it visible). Hover for the total; click it for the same list and controls as the macOS menu. **Exit** is at the bottom of the menu.
+
+The tray script has passed its self-test under PowerShell 7, but hasn't been run on Windows yet. If it misbehaves, please open an issue.
+
+## Troubleshooting
+
+- **"Working/idle unknown", or no Stop turn buttons.** The menu bar and tray measure RAM on their own, but working/idle status, Stop turn and Auto come from the mod running inside Claude sessions. At least one session started *after* you installed the mod must be open. Quit and reopen Claude (Step 1, item 5), or open a new Code session.
+- **Stop turn does nothing for one session.** A session can't stop its own turn. If that session is the only one running the mod, open another session.
+- **No panel.** Type `/session-ram` in the session.
+- **No menu-bar icon.** Check that `~/SwiftBarPlugins/session-ram.15s.py` exists and is executable (step 2 sets this), and that SwiftBar is running.
+
+## How it works
+
+- Every session with the mod measures all sessions every 15 seconds: one process listing (`ps` on macOS, PowerShell `Get-CimInstance Win32_Process` on Windows) and one status lookup per session through the app's own session tools.
+- Shared files in `~/.claude` (Windows: `%USERPROFILE%\.claude`) connect the panel, the menu bar and the tray:
+  - `session-ram-settings.json`: the limit and the Auto switch.
+  - `session-ram-status.json`: the latest snapshot, which the menu bar and tray read.
+  - `session-ram-stopped.json`: the sessions Auto stopped.
+  - `session-ram-requests.json`: Stop turn requests from the menu bar or tray. Any session running the mod carries them out within about 3 seconds.
+- Session names come from the app's files under `~/Library/Application Support/Claude/claude-code-sessions` (macOS) or `%APPDATA%\Claude\claude-code-sessions` (Windows).
+- On Windows, a session started fresh since the app opened shows as "Unknown session" until it's resumed, because Windows doesn't let one process read another's environment, where its ID lives.
+- The panel's **Archive** button is the only thing that archives, and only when you press it.
