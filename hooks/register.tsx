@@ -5,8 +5,10 @@ import type { Row, View } from '../types'
 
 const PANE = 'session-ram'
 const MGMT = 'ccd_session_mgmt'
-// The desktop app keeps one JSON file per session under <org>/<account>/ here.
+// The desktop app keeps one JSON file per session under <org>/<account>/ here
+// (macOS: under $HOME; Windows: under %APPDATA%, the app's Electron data folder).
 const SESSIONS_ROOT = 'Library/Application Support/Claude/claude-code-sessions'
+const SESSIONS_ROOT_WIN = 'Claude/claude-code-sessions'
 const TICK_MS = 15_000
 const DEFAULT_LIMIT_MB = 6144
 const SKIP_MS = 10 * 60_000
@@ -29,37 +31,71 @@ const errText = (err: unknown) => String(err).slice(0, 300)
 
 const gb = (mb: number) => `${(mb / 1024).toFixed(1)} GB`
 
-/** Session processes from `ps` output, each with the RAM of its whole process tree. */
-export function sessionProcs(psOut: string) {
+const PS_ARGV = ['ps', '-axww', '-o', 'pid=,ppid=,rss=,command=']
+const WIN_QUERY = 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,WorkingSetSize,CommandLine | ConvertTo-Json -Compress'
+const WIN_ARGV = ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', WIN_QUERY]
+
+/** macOS/Linux: `ps -o pid=,ppid=,rss=,command=` lines (rss in KB). */
+export function parsePs(out: string): Proc[] {
   const procs: Proc[] = []
-  for (const line of psOut.split('\n')) {
+  for (const line of out.split('\n')) {
     const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/.exec(line)
-    if (m) procs.push({ pid: Number(m[1]), ppid: Number(m[2]), kb: Number(m[3]), cmd: m[4] ?? "" })
+    if (m) procs.push({ pid: Number(m[1]), ppid: Number(m[2]), kb: Number(m[3]), cmd: m[4] ?? '' })
   }
+  return procs
+}
+
+type WinProc = { ProcessId?: number; ParentProcessId?: number; WorkingSetSize?: number; CommandLine?: string | null }
+
+/** Windows: WIN_QUERY's JSON (WorkingSetSize in bytes; one process comes back as an object, not a list). */
+export function parseWin(out: string): Proc[] {
+  const raw: WinProc | WinProc[] = JSON.parse(out.trim() || '[]')
+  return (Array.isArray(raw) ? raw : [raw]).map(p => ({
+    pid: Number(p.ProcessId),
+    ppid: Number(p.ParentProcessId),
+    kb: Math.round(Number(p.WorkingSetSize ?? 0) / 1024),
+    cmd: p.CommandLine ?? '',
+  }))
+}
+
+/** Session processes, each with the RAM of its whole process tree, and which one runs this mod. */
+export function sessionProcs(procs: Proc[]) {
   const kids = new Map<number, Proc[]>()
   for (const p of procs) {
     if (p.pid !== p.ppid) kids.set(p.ppid, [...(kids.get(p.ppid) ?? []), p])
   }
-  const treeKb = (pid: number): number =>
-    (kids.get(pid) ?? []).reduce((sum, c) => sum + c.kb + treeKb(c.pid), 0)
+  // shortcut: Windows reuses PIDs, so an orphan can be counted under a new process with its dead parent's PID; rare, check CreationDate if it shows up.
+  const treeKb = (pid: number, depth = 0): number =>
+    depth > 50 ? 0 : (kids.get(pid) ?? []).reduce((sum, c) => sum + c.kb + treeKb(c.pid, depth + 1), 0)
 
-  const roots = procs
-    .filter(p => p.cmd.includes('/MacOS/claude --output-format') && !p.cmd.includes('/Helpers/disclaimer '))
+  // The desktop app starts each session as `<path>/claude[.exe] --output-format ...`: the program
+  // itself must be claude, not a shell or grep whose arguments mention it. A launcher that still
+  // wraps it with the same args is dropped below, keeping only the innermost match.
+  const isSession = (cmd: string) => {
+    const exe = /^"?(.*?)"?\s+--output-format\b/.exec(cmd)?.[1]
+    return exe !== undefined && !/\s-/.test(exe) && /[\\/]claude(?:\.exe)?$/i.test(exe)
+  }
+  const matched = procs.filter(p => isSession(p.cmd))
+  const matchedPids = new Set(matched.map(p => p.pid))
+  const roots = matched
+    .filter(p => !(kids.get(p.pid) ?? []).some(c => matchedPids.has(c.pid)))
     .map(p => ({
       pid: p.pid,
-      cli: /--(?:resume|session-id)[= ]([0-9a-f-]{36})/.exec(p.cmd)?.[1],
+      cli: /--(?:resume|session-id)[= ]"?([0-9a-f-]{36})/.exec(p.cmd)?.[1],
       kb: p.kb,
       childKb: treeKb(p.pid),
     }))
 
-  // This session is the root above the `ps` that produced this output.
+  // This session is the root above the process listing it just ran.
   const byPid = new Map(procs.map(p => [p.pid, p]))
   const rootPids = new Set(roots.map(r => r.pid))
-  let cur = procs.find(p => p.cmd.startsWith('ps -axww'))
+  let cur = procs.find(p => p.cmd.startsWith('ps -axww') || p.cmd.includes('Get-CimInstance Win32_Process'))
   for (let hops = 0; cur && !rootPids.has(cur.pid) && hops < 50; hops++) cur = byPid.get(cur.ppid)
 
   return { roots, selfPid: cur && rootPids.has(cur.pid) ? cur.pid : undefined }
 }
+
+const isWindows = async ($: Engine) => (await $.env.get('OS')) === 'Windows_NT'
 
 async function mgmt($: Engine, tool: string, args: Record<string, unknown>) {
   const res = await $.mcp.call(MGMT, tool, args)
@@ -72,10 +108,12 @@ async function mgmt($: Engine, tool: string, args: Record<string, unknown>) {
 
 /** Maps CLI session ids (the --resume uuid) to the app's sessions, from the app's own session files. */
 async function scanSessionFiles($: Engine) {
-  const base = (name: string) => name.split('/').pop() ?? name
+  const base = (name: string) => name.split(/[\\/]/).pop() ?? name
   const subdirs = async (dir: string) =>
     (await $.fs.list(dir)).filter(e => e.kind === 'dir').map(e => `${dir}/${base(e.name)}`)
-  const root = `${await $.env.get('HOME')}/${SESSIONS_ROOT}`
+  const root = (await isWindows($))
+    ? `${await $.env.get('APPDATA')}/${SESSIONS_ROOT_WIN}`
+    : `${await $.env.get('HOME')}/${SESSIONS_ROOT}`
   const files: string[] = []
   for (const org of await subdirs(root)) {
     for (const account of await subdirs(org)) {
@@ -99,8 +137,9 @@ async function scanSessionFiles($: Engine) {
 }
 
 async function measure($: Engine): Promise<{ rows: Row[]; note: string }> {
-  const ps = await $.process.run(['ps', '-axww', '-o', 'pid=,ppid=,rss=,command='])
-  const { roots, selfPid } = sessionProcs(ps.stdout)
+  const win = await isWindows($)
+  const listing = await $.process.run(win ? WIN_ARGV : PS_ARGV)
+  const { roots, selfPid } = sessionProcs(win ? parseWin(listing.stdout) : parsePs(listing.stdout))
   if (roots.some(p => p.cli && !cliToMeta.has(p.cli))) await scanSessionFiles($)
   // One small get_session per loaded session: a full list_sessions overflows the tool-result limit.
   const listed = new Map<string, Listed>()
