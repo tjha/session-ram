@@ -1,0 +1,6 @@
+{
+  "name": "session-ram",
+  "version": "0.1.0",
+  "description": "Pane listing loaded Claude Code sessions with their RAM, a configurable RAM limit, and archive/stop buttons",
+  "types": "./types/index.d.ts"
+}

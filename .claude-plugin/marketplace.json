@@ -1,0 +1,5 @@
+{
+  "name": "session-ram",
+  "owner": { "name": "tjha" },
+  "plugins": [{ "name": "session-ram", "source": "./" }]
+}
