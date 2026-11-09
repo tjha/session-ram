@@ -26,6 +26,8 @@ STATUS = os.path.join(CLAUDE_DIR, "session-ram-status.json")
 STOPPED = os.path.join(CLAUDE_DIR, "session-ram-stopped.json")
 STATE = os.path.join(CLAUDE_DIR, "session-ram-menubar-state.json")
 REQUESTS = os.path.join(CLAUDE_DIR, "session-ram-requests.json")
+AUTOFIX = os.path.join(CLAUDE_DIR, "session-ram-autofix.json")
+AUTOFIX_STALE_MS = 10 * 60_000
 SESSIONS_GLOB = os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions/*/*/*.json")
 DEFAULT_LIMIT_MB = 6144
 STATUS_FRESH_MS = 60_000
@@ -178,11 +180,54 @@ def act(args):
         if time.time() * 1000 - float(status.get("writtenAt") or 0) > STATUS_FRESH_MS:
             notify("No Claude session is running the session-ram mod, so the stop can't happen yet. Open a new Claude session.")
         return
+    elif args[0] == "autofix-off":
+        # Only the session itself can switch off its PR's Auto-fix; the mod in it does so once it runs.
+        requests = read_json(REQUESTS, {})
+        requests[f"autofix-off:{args[1]}"] = {"action": "autofix-off", "session": args[1], "at": time.time() * 1000}
+        write_json(REQUESTS, requests)
+        notify("Auto-fix turns off the next time that session runs. Claude may ask you to approve it there.")
+        return
     elif args[0] == "panel":
         s["autoOpenPanel"] = not s["autoOpenPanel"]
     elif args[0] == "auto":
         s["isAuto"] = not s["isAuto"]
     write_json(SETTINGS, s)
+
+
+def autofix_lines(autofix, working, loaded, pending_af, titles, now_ms, me):
+    """The Auto-fix section: open PRs whose session Auto-fix can wake, and whether each is running now."""
+    checked_at = float(autofix.get("checkedAt") or 0)
+    if not checked_at or now_ms - checked_at > AUTOFIX_STALE_MS:
+        return ["Auto-fix: not checked yet (needs a Claude session running the mod) | color=gray"]
+    if autofix.get("checked") and autofix.get("errors") == autofix.get("checked"):
+        return ["Auto-fix: couldn't read PR status | color=gray"]
+    found = autofix.get("sessions") or []
+    age = max(0, int((now_ms - checked_at) // 60_000))
+    when = "just now" if age == 0 else f"{age} min ago"
+    n_running = sum(1 for a in found if working.get(a["sessionId"]))
+    head = f"Auto-fix on: {len(found)} open PR{'' if len(found) == 1 else 's'}" + (f", {n_running} running now" if n_running else "")
+    lines = [f"{head} (checked {when}){' | color=orange' if n_running > 1 else ''}"]
+    for a in found:
+        sid = a["sessionId"]
+        if working.get(sid):
+            mark, opts = "●", " color=green"
+        elif sid in loaded:
+            mark, opts = "○", ""
+        else:
+            mark, opts = "·", ""
+        if a.get("isCiKnown") is False:
+            ci = "CI: unknown"
+        else:
+            ci = f"CI: {a['failing']} failing" if a.get("failing") else ("CI: running" if a.get("pending") else "CI: passing")
+        title = clean(titles.get(sid) or a.get("title") or sid)
+        lines.append(f"--{mark} #{a['pr']}  {title}  ({ci}) | length=70{opts}")
+        lines.append(f"----Open PR | href={a['url']}")
+        lines.append(f"----Open in Claude | href=claude://claude.ai/epitaxy/{sid}")
+        if sid in pending_af:
+            lines.append("----Turning off… (when the session next runs)")
+        else:
+            lines.append(f"----Turn off Auto-fix | bash={json.dumps(me)} param1=autofix-off param2={sid} terminal=false refresh=true")
+    return lines
 
 
 def render():
@@ -198,6 +243,9 @@ def render():
     working = {r.get("sessionId"): r.get("isWorking") for r in status.get("rows", [])} if is_fresh else {}
     stopped = read_json(STOPPED, {})
     pending = read_json(REQUESTS, {})
+    pending_af = {r.get("session") for r in pending.values() if isinstance(r, dict) and r.get("action") == "autofix-off"}
+    autofix = read_json(AUTOFIX, {})
+    on_autofix = {a.get("sessionId") for a in autofix.get("sessions") or []}
 
     total_mb = sum(r[2] for r in rows) // 1024
     limit_mb = s["limitMb"]
@@ -236,6 +284,8 @@ def render():
             mark, opts = "·", ""
         link = f" href=claude://claude.ai/epitaxy/{sid}" if sid else ""
         label = f"{mark} {fmt(mb)}  {clean(title)}" + ("  (stopped: over limit)" if sid in stopped else "")
+        if sid in on_autofix:
+            label += "  ↻ Auto-fix"
         if sid in pending:
             label += "  (stopping…)"
         print(f"{label} | length=60{opts}{link}")
@@ -245,8 +295,11 @@ def render():
             print(f"--Open in Claude |{link}")
         if sid and working.get(sid) and sid not in pending:
             print(f"--Stop turn | bash={json.dumps(os.path.abspath(__file__))} param1=stop param2={sid} terminal=false refresh=true")
-    print("---")
     me = os.path.abspath(__file__)
+    print("---")
+    for line in autofix_lines(autofix, working, set(sid_of.values()), pending_af, titles, now_ms, me):
+        print(line)
+    print("---")
     print(f"Limit: {fmt(limit_mb)}")
     print(f"--Set limit… | bash={json.dumps(me)} param1=limit-ask terminal=false refresh=true")
     for gb in (4, 6, 8, 12, 16):
@@ -288,6 +341,16 @@ def selftest():
     finally:
         os.remove(SETTINGS)
         SETTINGS = real
+    now = 10_000_000
+    af = {"checkedAt": now - 120_000, "checked": 3, "errors": 0, "sessions": [
+        {"sessionId": "local_a", "title": "A", "pr": 11, "url": "https://x/11", "failing": 2, "pending": 0},
+        {"sessionId": "local_b", "title": "B", "pr": 12, "url": "https://x/12", "failing": 0, "pending": 3}]}
+    lines = autofix_lines(af, {"local_a": True}, {"local_a"}, {"local_b"}, {}, now, "/me")
+    assert lines[0] == "Auto-fix on: 2 open PRs, 1 running now (checked 2 min ago)", lines[0]
+    assert lines[1] == "--● #11  A  (CI: 2 failing) | length=70 color=green", lines[1]
+    assert "param1=autofix-off param2=local_a" in lines[4], lines[4]
+    assert lines[5].startswith("--· #12  B  (CI: running)") and lines[8] == "----Turning off… (when the session next runs)", lines
+    assert autofix_lines({}, {}, set(), set(), {}, now, "/me")[0].startswith("Auto-fix: not checked yet")
     assert parse_limit_mb("512 MB") is None and parse_limit_mb("lots") is None and parse_limit_mb("") is None
     print("selftest ok")
 

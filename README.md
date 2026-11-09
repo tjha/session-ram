@@ -20,6 +20,8 @@ Both show every session loaded in memory, largest first, with its RAM (including
 
 **Limit and Auto.** Set a RAM limit (default 6 GB) by typing a value like `8` or `8 GB`, or with the presets. Going over it warns you. With **Auto** on, while you're over the limit it stops the in-progress turn of the largest working session and flags it red, one session every 20 seconds at most. **Auto never archives or closes anything**, and it's off by default. The limit can't hard-cap RAM: it warns and, with Auto, stops turns.
 
+**Auto-fix PRs (menu bar).** Auto-fix wakes a session whenever its PR's CI fails or gets a review comment, so several can start working at once. The menu bar lists every open PR with Auto-fix on, which of their sessions are running right now (● green), the CI state, and links to the PR and the session. **Turn off Auto-fix** switches it off for that PR. The app only lets a session change its own Auto-fix, so this happens the next time that session runs, and Claude may ask you to approve it there. Sessions with Auto-fix also show **↻ Auto-fix** in the main list.
+
 **Panel on start.** The panel opens by itself when a session starts. If you use the menu bar or tray instead, switch off **Open panel when a session starts** in their menu; you can still open the panel with `/session-ram`.
 
 ## Install
@@ -110,7 +112,8 @@ The tray script has passed its self-test under PowerShell 7, but hasn't been run
   - `session-ram-settings.json`: the limit and the Auto switch.
   - `session-ram-status.json`: the latest snapshot, which the menu bar and tray read.
   - `session-ram-stopped.json`: the sessions Auto stopped.
-  - `session-ram-requests.json`: Stop turn requests from the menu bar or tray. Any session running the mod carries them out within about 3 seconds.
+  - `session-ram-requests.json`: requests from the menu bar or tray. Any session running the mod carries out **Stop turn** within about 3 seconds; **Turn off Auto-fix** is carried out by that session itself.
+  - `session-ram-autofix.json`: open PRs with Auto-fix on. One session checks every live session's PR status at most every 2 minutes.
 - Session names come from the app's files under `~/Library/Application Support/Claude/claude-code-sessions` (macOS) or `%APPDATA%\Claude\claude-code-sessions` (Windows).
 - On Windows, a session started fresh since the app opened shows as "Unknown session" until it's resumed, because Windows doesn't let one process read another's environment, where its ID lives.
 - The panel's **Archive** button is the only thing that archives, and only when you press it.

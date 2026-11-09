@@ -5,6 +5,8 @@ import type { Row, View } from '../types'
 
 const PANE = 'session-ram'
 const MGMT = 'ccd_session_mgmt'
+const PR = 'ccd_pr'
+const AUTOFIX_EVERY_MS = 120_000
 // The desktop app keeps one JSON file per session under <org>/<account>/ here
 // (macOS: under $HOME; Windows: under %APPDATA%, the app's Electron data folder).
 const SESSIONS_ROOT = 'Library/Application Support/Claude/claude-code-sessions'
@@ -26,6 +28,8 @@ type Listed = { sessionId: string; title: string; isRunning: boolean }
 // Module state: lost on reload, which only costs a re-read.
 const cliToMeta = new Map<string, { sessionId: string; title: string }>()
 const titleById = new Map<string, string>()
+// Sessions not archived, from the app's session files: the ones whose PRs the Auto-fix check reads.
+const liveIds = new Set<string>()
 let wasOver = false
 let inFlight: Promise<void> | undefined
 
@@ -99,8 +103,8 @@ export function sessionProcs(procs: Proc[]) {
 
 const isWindows = async ($: Engine) => (await $.env.get('OS')) === 'Windows_NT'
 
-async function mgmt($: Engine, tool: string, args: Record<string, unknown>) {
-  const res = await $.mcp.call(MGMT, tool, args)
+async function mgmt($: Engine, tool: string, args: Record<string, unknown>, server = MGMT) {
+  const res = await $.mcp.call(server, tool, args)
   const text = res.content.map(b => b.text ?? '').join('')
   // The app's tools can answer a failure as plain "Error: ..." text without isError.
   if (res.isError || /^\s*error\b/i.test(text)) throw new Error(text.slice(0, 300) || `${tool} failed`)
@@ -126,10 +130,12 @@ async function scanSessionFiles($: Engine) {
   }
 
   cliToMeta.clear()
+  liveIds.clear()
   for (const file of files) {
     try {
       const meta = JSON.parse(await $.fs.read(file))
       if (typeof meta.sessionId === 'string') titleById.set(meta.sessionId, meta.title ?? meta.sessionId)
+      if (typeof meta.sessionId === 'string' && !meta.isArchived) liveIds.add(meta.sessionId)
       for (const id of [meta.cliSessionId, meta.lastAssistantCliSessionId]) {
         if (typeof id === 'string') cliToMeta.set(id, { sessionId: meta.sessionId, title: meta.title ?? meta.sessionId })
       }
@@ -227,37 +233,107 @@ async function writeSettings($: Engine, s: Settings) {
 /** Sessions Auto stopped for going over the limit, by session id: shared so every session and the menu bar highlight them. */
 type Flags = Record<string, { at: number; mb: number; title: string }>
 
+type Request = { action: string; at: number; session?: string }
+
 /**
- * Stop requests from the menu bar or tray, which can't reach the app's session tools: any session
- * running this mod carries them out. A session can't stop its own turn, so it leaves requests for
- * itself to the others.
- * shortcut: two writers can race and drop a request made in the same instant; clicking Stop again re-sends it.
+ * Requests from the menu bar or tray, which can't reach the app's session tools.
+ * - `stop` (keyed by session id): any other session running this mod stops that session's turn;
+ *   a session can't stop its own turn.
+ * - `autofix-off` (keyed `autofix-off:<id>`): only that session itself can switch off its PR's
+ *   Auto-fix, so it waits until that session runs (an Auto-fix event waking it is enough).
+ * shortcut: two writers can race and drop a request made in the same instant; clicking again re-sends it.
  */
 async function handleRequests($: Engine) {
   const path = `${await claudeDir($)}/session-ram-requests.json`
-  let requests: Record<string, { action: string; at: number }>
+  let requests: Record<string, Request>
   try {
     requests = JSON.parse(await $.fs.read(path))
   } catch {
     return
   }
   const selfId = await $.env.get('CLAUDE_CODE_HOST_SESSION_ID')
-  const mine = Object.entries(requests).filter(([id]) => id !== selfId)
+  const isMine = ([key, r]: [string, Request]) =>
+    r.action === 'stop' ? key !== selfId : r.action === 'autofix-off' && !!selfId && r.session === selfId
+  const mine = Object.entries(requests).filter(isMine)
   if (mine.length === 0) return
-  const rest = Object.fromEntries(Object.entries(requests).filter(([id]) => id === selfId))
-  await $.fs.write(path, JSON.stringify(rest))
+  await $.fs.write(path, JSON.stringify(Object.fromEntries(Object.entries(requests).filter(e => !isMine(e)))))
   const now = await $.clock.now()
-  for (const [id, r] of mine) {
-    if (r.action !== 'stop' || now - r.at > 120_000) continue
-    const title = titleById.get(id) ?? id
-    try {
-      await mgmt($, 'stop_session', { session_id: id })
-      $.ui.toast(`Stopped the turn in "${title}" (asked from the menu bar).`)
-    } catch (err) {
-      $.ui.toast(`Could not stop "${title}": ${errText(err)}`)
+  for (const [key, r] of mine) {
+    if (r.action === 'stop') {
+      if (now - r.at > 120_000) continue
+      const title = titleById.get(key) ?? key
+      try {
+        await mgmt($, 'stop_session', { session_id: key })
+        $.ui.toast(`Stopped the turn in "${title}" (asked from the menu bar).`)
+      } catch (err) {
+        $.ui.toast(`Could not stop "${title}": ${errText(err)}`)
+      }
+    } else {
+      try {
+        const status = JSON.parse(await mgmt($, 'get_status', {}, PR))
+        if (status.bound && status.monitor?.auto_fix) {
+          await mgmt($, 'set_monitor', { auto_fix: false, address_comments: false, url: status.pr.url }, PR)
+          $.ui.toast(`Turned off Auto-fix for PR #${status.pr.number} (asked from the menu bar).`)
+        }
+      } catch (err) {
+        $.ui.toast(`Could not turn off Auto-fix: ${errText(err)}`)
+      }
     }
   }
   await tick($)
+  await scanAutofix($, true)
+}
+
+/**
+ * Which sessions have Auto-fix on for an open PR: Auto-fix wakes them on CI failures and review
+ * comments, so several can start working at once. The app keeps the switch per session, so this
+ * reads each live session's PR status. One check every 2 minutes across all sessions, recorded in
+ * a shared file the menu bar and tray read.
+ */
+let autofixInFlight: Promise<void> | undefined
+
+function scanAutofix($: Engine, isForced = false): Promise<void> {
+  autofixInFlight ??= runAutofixScan($, isForced).finally(() => {
+    autofixInFlight = undefined
+  })
+  return autofixInFlight
+}
+
+async function runAutofixScan($: Engine, isForced: boolean) {
+  const path = `${await claudeDir($)}/session-ram-autofix.json`
+  let prev: { checkedAt?: number; sessions?: unknown[] } | undefined
+  try {
+    prev = JSON.parse(await $.fs.read(path))
+  } catch {
+    prev = undefined
+  }
+  const now = await $.clock.now()
+  if (!isForced && prev?.checkedAt && now - prev.checkedAt < AUTOFIX_EVERY_MS) return
+  // Claim this round, then check the claim held: when Claude starts, many sessions get here together.
+  const owner = `${await $.env.get('CLAUDE_CODE_HOST_SESSION_ID')}:${now}:${Math.random()}`
+  await $.fs.write(path, JSON.stringify({ ...prev, checkedAt: now, owner }))
+  if (JSON.parse(await $.fs.read(path)).owner !== owner) return
+  await scanSessionFiles($)
+  const ids = [...liveIds]
+  const sessions: { sessionId: string; title: string; pr: number; url: string; failing: number; pending: number; isCiKnown: boolean }[] = []
+  let errors = 0
+  for (let i = 0; i < ids.length; i += 10) {
+    await Promise.all(
+      ids.slice(i, i + 10).map(async id => {
+        try {
+          const st = JSON.parse(await mgmt($, 'get_status', { session_id: id }, PR))
+          if (st.bound && st.monitor?.auto_fix && st.pr?.state === 'open') {
+            const title = titleById.get(id) ?? id
+            sessions.push({ sessionId: id, title, pr: st.pr.number, url: st.pr.url, failing: st.checks?.failing ?? 0, pending: st.checks?.pending ?? 0, isCiKnown: st.checks?.available === true })
+          }
+        } catch {
+          errors++
+        }
+      }),
+    )
+  }
+  const result = { checkedAt: now, checked: ids.length, errors, sessions: sessions.sort((a, b) => a.pr - b.pr) }
+  await $.fs.write(path, JSON.stringify(result))
 }
 
 async function readFlags($: Engine): Promise<Flags> {
@@ -391,6 +467,8 @@ export const register: Register = on => {
     void tick($)
     $.clock.every(TICK_MS, () => tick($))
     $.clock.every(3_000, () => handleRequests($).catch(() => {}))
+    // Each session's period differs a little, so sessions that start together don't all check together.
+    $.clock.every(30_000 + Math.round(Math.random() * 10_000), () => scanAutofix($).catch(() => {}))
 
     return started
   })

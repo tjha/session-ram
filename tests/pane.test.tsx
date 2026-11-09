@@ -350,3 +350,83 @@ test('with autoOpenPanel off, a starting session does not open the panel; /sessi
   await $.command.run({ command: 'session-ram' })
   expect(opened).toEqual(['session-ram'])
 })
+
+const autofixMocks = (on: Parameters<Parameters<typeof test>[1]>[1], written: Record<string, string>, calls: { tool: string; args: Record<string, unknown> }[], status: (args: Record<string, unknown>) => unknown) => {
+  const FILES: Record<string, object> = {
+    'local_s1.json': { sessionId: 'local_s1', title: 'Open PR with Auto-fix' },
+    'local_s2.json': { sessionId: 'local_s2', title: 'Merged PR with Auto-fix' },
+    'local_s3.json': { sessionId: 'local_s3', title: 'Open PR, Auto-fix off' },
+    'local_s4.json': { sessionId: 'local_s4', title: 'Archived', isArchived: true },
+  }
+  on('command.register', () => ({ value: { command: 'session-ram' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/Users/x' : e.name === 'CLAUDE_CODE_HOST_SESSION_ID' ? 'local_s1' : undefined }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
+  on('fs.list', (_, e) => {
+    const path = String(e.path)
+    if (path.endsWith('claude-code-sessions')) return { value: [{ name: 'org1', kind: 'dir' }] }
+    if (path.endsWith('/org1')) return { value: [{ name: 'acct1', kind: 'dir' }] }
+    return { value: Object.keys(FILES).map(name => ({ name, kind: 'file' })) }
+  })
+  on('fs.read', (_, e) => {
+    const path = String(e.path)
+    if (path in written) return { value: written[path] ?? '' }
+    const name = path.split('/').pop() ?? ''
+    if (name in FILES) return { value: JSON.stringify(FILES[name]) }
+    throw new Error('ENOENT')
+  })
+  on('fs.write', (_, e) => {
+    written[String(e.path)] = String(e.text)
+    return { value: undefined }
+  })
+  on('mcp.call', (_, e) => {
+    const args = (e.args ?? {}) as Record<string, unknown>
+    calls.push({ tool: String(e.tool), args })
+    return e.tool === 'get_status' ? text(status(args)) : text({ ok: true })
+  })
+  on('tool.register', () => ({ value: { tool: 'mcp__session-ram__snapshot' } }))
+  on('clock.every', () => ({ value: {} }))
+  on('clock.now', () => ({ value: 5_000_000 }))
+  on('ui.toast', () => ({ value: undefined }))
+}
+
+test('the Auto-fix check lists live sessions with Auto-fix on an open PR, once per round', async ($, on) => {
+  const written: Record<string, string> = {}
+  const calls: { tool: string; args: Record<string, unknown> }[] = []
+  const PRS: Record<string, object> = {
+    local_s1: { bound: true, pr: { number: 11, url: 'https://x/pull/11', state: 'open' }, checks: { available: true, failing: 2, pending: 1 }, monitor: { auto_fix: true } },
+    local_s2: { bound: true, pr: { number: 12, url: 'https://x/pull/12', state: 'merged' }, checks: {}, monitor: { auto_fix: true } },
+    local_s3: { bound: true, pr: { number: 13, url: 'https://x/pull/13', state: 'open' }, checks: {}, monitor: { auto_fix: false } },
+  }
+  autofixMocks(on, written, calls, args => PRS[String(args.session_id)] ?? { bound: false })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await new Promise(r => setTimeout(r, 50))
+
+  const result = JSON.parse(written['/Users/x/.claude/session-ram-autofix.json'] ?? '{}')
+  expect(result.sessions).toEqual([{ sessionId: 'local_s1', title: 'Open PR with Auto-fix', pr: 11, url: 'https://x/pull/11', failing: 2, pending: 1, isCiKnown: true }])
+  // Three live sessions read once each: the archived one is skipped, and the second scan in the round is skipped.
+  expect(calls.filter(c => c.tool === 'get_status').map(c => c.args.session_id).sort()).toEqual(['local_s1', 'local_s2', 'local_s3'])
+})
+
+test('an Auto-fix request is carried out only by its own session', async ($, on) => {
+  const written: Record<string, string> = {
+    '/Users/x/.claude/session-ram-requests.json': JSON.stringify({
+      'autofix-off:local_s1': { action: 'autofix-off', session: 'local_s1', at: 1 },
+      'autofix-off:local_s3': { action: 'autofix-off', session: 'local_s3', at: 1 },
+    }),
+    // A recent round, so the scan doesn't add get_status calls of its own.
+    '/Users/x/.claude/session-ram-autofix.json': JSON.stringify({ checkedAt: 4_999_000, sessions: [] }),
+  }
+  const calls: { tool: string; args: Record<string, unknown> }[] = []
+  autofixMocks(on, written, calls, args =>
+    args.session_id === undefined ? { bound: true, pr: { number: 11, url: 'https://x/pull/11', state: 'open' }, monitor: { auto_fix: true } } : { bound: false },
+  )
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await new Promise(r => setTimeout(r, 50))
+
+  expect(calls.filter(c => c.tool === 'set_monitor').map(c => c.args)).toEqual([{ auto_fix: false, address_comments: false, url: 'https://x/pull/11' }])
+  expect(Object.keys(JSON.parse(written['/Users/x/.claude/session-ram-requests.json'] ?? '{}'))).toEqual(['autofix-off:local_s3'])
+})
