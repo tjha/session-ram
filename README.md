@@ -9,7 +9,7 @@ See how much RAM each Claude Code session in the Claude desktop app is using, wh
 - **Panel:** beside each Code session in the Claude desktop app.
 - **Menu bar (macOS) or tray icon (Windows):** always visible, whichever session you're in. Optional.
 
-Both show every session loaded in memory, largest first, with its RAM (including the lint, tsc and dev-server processes it started) and its status:
+Both show every session loaded in memory, largest first, with its RAM and its status. On macOS, RAM is the memory footprint that Activity Monitor's Memory column shows. It includes memory macOS has compressed, which `ps` leaves out (often half of an idle session's). A session's RAM includes the build, test, lint and dev-server processes it started, including ones still running in the background after the command that started them ended (`npm run dev &`, `nohup`, daemons).
 
 | Mark | Color | Meaning |
 | --- | --- | --- |
@@ -18,7 +18,9 @@ Both show every session loaded in memory, largest first, with its RAM (including
 | ⚠ | red | **Stopped (over limit)**: Auto stopped its turn. Look into it before resuming; the flag clears once you resume it. |
 | · | gray | **Unknown**: no session running the mod has reported in the last minute (see Troubleshooting). |
 
-**Limit and Auto.** Set a RAM limit (default 6 GB) by typing a value like `8` or `8 GB`, or with the presets. Going over it warns you. With **Auto** on, while you're over the limit it stops the in-progress turn of the largest working session and flags it red, one session every 20 seconds at most. **Auto never archives or closes anything**, and it's off by default. The limit can't hard-cap RAM: it warns and, with Auto, stops turns.
+**Dev servers, MCP servers, leftovers.** One more line counts what isn't part of a loaded session: dev servers and MCP servers the app itself starts (the preview pane's servers, for example), and processes still running from sessions that are no longer loaded. The menu bar lists the largest of them by name and process ID, so you can end them yourself. They count toward the total and the limit.
+
+**Limit and Auto.** Set a RAM limit (default 6 GB) by typing a value like `8` or `8 GB`, or with the presets. Going over it warns you. With **Auto** on, while you're over the limit it stops the in-progress turn of the largest working session and flags it red, one session every 20 seconds at most. **Auto never archives or closes anything**, and it's off by default. The limit can't hard-cap RAM: it warns and, with Auto, stops turns. Stopping a turn ends the command running in it, but not processes that run in the background, such as dev servers; end those yourself.
 
 **Auto-fix PRs (menu bar).** Auto-fix wakes a session whenever its PR's CI fails or gets a review comment, so several can start working at once. The menu bar lists every open PR with Auto-fix on, which of their sessions are running right now (● green), the CI state, and links to the PR and the session. **Turn off Auto-fix** switches it off for that PR. The app only lets a session change its own Auto-fix, so this happens the next time that session runs, and Claude may ask you to approve it there. Sessions with Auto-fix also show **↻ Auto-fix** in the main list.
 
@@ -107,7 +109,8 @@ The tray script has passed its self-test under PowerShell 7, but hasn't been run
 
 ## How it works
 
-- Every session with the mod measures all sessions every 15 seconds: one process listing (`ps` on macOS, PowerShell `Get-CimInstance Win32_Process` on Windows) and one status lookup per session through the app's own session tools.
+- Every 15 seconds one session with the mod measures all sessions: a process listing (`ps` on macOS, PowerShell `Get-CimInstance Win32_Process` on Windows), each process's memory footprint on macOS (`top`, about 0.4 seconds of CPU), and one status lookup per session through the app's own session tools. That session also runs Auto. The other sessions show its snapshot; if it closes, the next one takes over.
+- The menu bar reads footprints directly (`proc_pid_rusage`), which takes a few milliseconds. On Windows, RAM is each process's working set.
 - Shared files in `~/.claude` (Windows: `%USERPROFILE%\.claude`) connect the panel, the menu bar and the tray:
   - `session-ram-settings.json`: the limit and the Auto switch.
   - `session-ram-status.json`: the latest snapshot, which the menu bar and tray read.
@@ -115,5 +118,6 @@ The tray script has passed its self-test under PowerShell 7, but hasn't been run
   - `session-ram-requests.json`: requests from the menu bar or tray. Any session running the mod carries out **Stop turn** within about 3 seconds; **Turn off Auto-fix** is carried out by that session itself.
   - `session-ram-autofix.json`: open PRs with Auto-fix on. One session checks every live session's PR status at most every 2 minutes.
 - Session names come from the app's files under `~/Library/Application Support/Claude/claude-code-sessions` (macOS) or `%APPDATA%\Claude\claude-code-sessions` (Windows).
-- On Windows, a session started fresh since the app opened shows as "Unknown session" until it's resumed, because Windows doesn't let one process read another's environment, where its ID lives.
+- A process inherits its session's ID (`CLAUDE_CODE_HOST_SESSION_ID`) in its environment. On macOS that is how a session started fresh is named, and how a build or test process that kept running in the background (and so moved out from under its session) is matched back to it.
+- On Windows, a session started fresh since the app opened shows as "Unknown session" until it's resumed, and background processes that outlive the command that started them aren't counted, because Windows doesn't let one process read another's environment.
 - The panel's **Archive** button is the only thing that archives, and only when you press it.

@@ -5,13 +5,14 @@
 # <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>
 """SwiftBar plugin (macOS menu bar) for the session-ram mod.
 
-Measures every Claude Code session the desktop app has loaded (`ps`, whole process tree) and
-names it from the app's session files. Working/idle and the Auto stops come from files the
+Measures every Claude Code session the desktop app has loaded (`ps`, whole process tree, each
+process's memory footprint as Activity Monitor shows it) and names it from the app's session files. Working/idle and the Auto stops come from files the
 session-ram mod writes in ~/.claude, so they need at least one Claude session running the mod.
 The limit and Auto switch live in ~/.claude/session-ram-settings.json, shared with the mod.
 
 Run with `--selftest` to check the process matching.
 """
+import ctypes
 import glob
 import json
 import os
@@ -70,6 +71,32 @@ def parse_ps(out):
     return procs
 
 
+class RusageInfoV2(ctypes.Structure):
+    """<sys/resource.h> rusage_info_v2: ri_uuid, then 26 uint64 counters; ri_phys_footprint is the 8th."""
+    _fields_ = [("uuid", ctypes.c_uint8 * 16), ("before", ctypes.c_uint64 * 7), ("phys_footprint", ctypes.c_uint64), ("after", ctypes.c_uint64 * 10)]
+
+
+def footprints(pids):
+    """pid -> memory footprint in KB, what Activity Monitor shows. Unlike ps's RSS it includes memory macOS
+    compressed, often half of an idle session's. Missing for processes this user can't inspect."""
+    try:
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+    except OSError:
+        return {}
+    out = {}
+    for pid in pids:
+        info = RusageInfoV2()
+        if lib.proc_pid_rusage(pid, 2, ctypes.byref(info)) == 0:  # 2: RUSAGE_INFO_V2
+            out[pid] = info.phys_footprint // 1024
+    return out
+
+
+def with_footprints(procs):
+    """The ps rows with RSS replaced by the footprint where it can be read."""
+    fp = footprints([p[0] for p in procs])
+    return [(pid, ppid, fp.get(pid, kb), cmd) for pid, ppid, kb, cmd in procs]
+
+
 def is_session(cmd):
     """The program itself is claude, started as `claude --output-format ...` (same rule as the mod)."""
     m = re.match(r'^"?(.*?)"?\s+--output-format\b', cmd)
@@ -77,25 +104,49 @@ def is_session(cmd):
 
 
 def session_procs(procs):
-    """[(pid, cli_session_id, total_kb, child_kb)] for each session, largest first."""
+    """Same rules as the mod's sessionProcs:
+    - [(pid, cli_session_id, total_kb, child_kb)] for each session, largest first;
+    - [(pid, kb, command)] the app started through its launcher (preview dev servers, MCP servers);
+    - [(pid, kb, command)] under launchd (pid 1): build and test processes that detached (`&`, nohup,
+      daemons) are among them, and their environment names the session that started them."""
     kids = {}
     for p in procs:
         if p[0] != p[1]:
             kids.setdefault(p[1], []).append(p)
+    counted = set()  # each process counts once
 
     def tree_kb(pid, depth=0):
-        return 0 if depth > 50 else sum(c[2] + tree_kb(c[0], depth + 1) for c in kids.get(pid, []))
+        total = 0
+        for c in kids.get(pid, []) if depth <= 50 else []:
+            if c[0] not in counted:
+                counted.add(c[0])
+                total += c[2] + tree_kb(c[0], depth + 1)
+        return total
+
+    def own_kb(p):
+        counted.add(p[0])
+        return p[2] + tree_kb(p[0])
 
     matched = [p for p in procs if is_session(p[3])]
     pids = {p[0] for p in matched}
+
+    def is_wrapper(p):
+        return any(c[0] in pids for c in kids.get(p[0], []))
+
     out = []
     for p in matched:
-        if any(c[0] in pids for c in kids.get(p[0], [])):
+        if is_wrapper(p):
             continue  # a launcher wrapping the real session process
         cli = re.search(r'--(?:resume|session-id)[= ]"?([0-9a-f-]{36})', p[3])
+        counted.add(p[0])
         child = tree_kb(p[0])
         out.append((p[0], cli[1] if cli else None, p[2] + child, child))
-    return sorted(out, key=lambda r: -r[2])
+    app = []
+    for p in procs:
+        if re.search(r"[\\/]Helpers[\\/]disclaimer\b", p[3]) and not is_wrapper(p) and p[0] not in counted:
+            app.append((p[0], own_kb(p), p[3]))
+    detached = [(p[0], own_kb(p), p[3]) for p in procs if p[1] == 1 and p[0] not in counted]
+    return sorted(out, key=lambda r: -r[2]), app, detached
 
 
 def session_meta():
@@ -114,7 +165,8 @@ def session_meta():
 
 
 def host_ids(pids):
-    """pid -> app session id, read from each session process's environment (names sessions started fresh)."""
+    """pid -> app session id, read from each process's environment: names sessions started fresh, and the
+    session a detached build or test process came from (it inherits the variable)."""
     if not pids:
         return {}
     out = subprocess.run(["ps", "-wwE", "-o", "pid=,command=", "-p", ",".join(map(str, pids))], capture_output=True, text=True).stdout
@@ -124,6 +176,12 @@ def host_ids(pids):
         if m:
             ids[int(m[1])] = m[2]
     return ids
+
+
+def short_cmd(cmd):
+    """`node server.js` for `/opt/homebrew/bin/node server.js`, without the app's launcher prefix."""
+    cmd = re.sub(r"^.*?[\\/]Helpers[\\/]disclaimer\b.*? -- ", "", cmd)
+    return re.sub(r"^\S*[\\/]", "", cmd)[:50]
 
 
 def fmt(mb):
@@ -235,10 +293,20 @@ def autofix_lines(autofix, working, loaded, pending_af, titles, now_ms, me):
 
 def render():
     out = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,rss=,command="], capture_output=True, text=True).stdout
-    rows = session_procs(parse_ps(out))
+    rows, other, detached = session_procs(with_footprints(parse_ps(out)))
     by_cli, titles = session_meta()
-    hosts = host_ids([r[0] for r in rows])
+    hosts = host_ids([r[0] for r in rows] + [d[0] for d in detached])
     sid_of = {r[0]: hosts.get(r[0]) or by_cli.get(r[1]) for r in rows}
+    # A detached process counts with the loaded session that started it; one from a closed session counts as other.
+    extra = {}
+    for pid, kb, cmd in detached:
+        sid = hosts.get(pid)
+        if sid and sid in sid_of.values():
+            extra[sid] = extra.get(sid, 0) + kb
+        elif sid:
+            other.append((pid, kb, cmd))
+    rows = sorted(((pid, cli, kb + extra.get(sid_of[pid], 0), child + extra.get(sid_of[pid], 0)) for pid, cli, kb, child in rows), key=lambda r: -r[2])
+    other_mb = sum(o[1] for o in other) // 1024
     s = settings()
     status = read_json(STATUS, {})
     now_ms = time.time() * 1000
@@ -250,7 +318,7 @@ def render():
     autofix = read_json(AUTOFIX, {})
     on_autofix = {a.get("sessionId") for a in autofix.get("sessions") or []}
 
-    total_mb = sum(r[2] for r in rows) // 1024
+    total_mb = (sum(r[2] for r in rows) + sum(o[1] for o in other)) // 1024
     limit_mb = s["limitMb"]
     is_over = total_mb > limit_mb
     n_working = sum(1 for r in rows if working.get(sid_of[r[0]]))
@@ -298,6 +366,11 @@ def render():
             print(f"--Open in Claude |{link}")
         if sid and working.get(sid) and sid not in pending:
             print(f"--Stop turn | bash={json.dumps(os.path.abspath(__file__))} param1=stop param2={sid} terminal=false refresh=true")
+    if other_mb > 0:
+        print(f"· {fmt(other_mb)}  Dev servers, MCP servers, leftovers | length=60")
+        print("--Started by the app, or left running by sessions since closed. Counted in the total. | size=11")
+        for pid, kb, cmd in sorted(other, key=lambda o: -o[1])[:8]:
+            print(f"--{fmt(kb // 1024)}  {clean(short_cmd(cmd))}  (pid {pid}) | length=60")
     me = os.path.abspath(__file__)
     print("---")
     for line in autofix_lines(autofix, working, set(sid_of.values()), pending_af, titles, now_ms, me):
@@ -327,10 +400,22 @@ def selftest():
         " 400 1 2048 /bin/zsh -c ps -axo command | grep '[M]acOS/claude --output-format'",
         ' 500 1 4096 "C:\\Users\\x\\claude.exe" --output-format stream-json --session-id=cccccccc-0000-0000-0000-000000000003',
     ])
-    rows = session_procs(parse_ps(ps))
+    rows, app, detached = session_procs(parse_ps(ps + "\n" + "\n".join([
+        " 600 1 307200 /opt/homebrew/bin/node next dev",
+        " 601 600 102400 /opt/homebrew/bin/node worker.js",
+        " 700 2 1024 /Applications/Claude.app/Contents/Helpers/disclaimer -- /opt/homebrew/bin/node server.js",
+        " 701 700 51200 /opt/homebrew/bin/node server.js",
+    ])))
+    assert app == [(700, 1024 + 51200, "/Applications/Claude.app/Contents/Helpers/disclaimer -- /opt/homebrew/bin/node server.js")], app
+    assert (600, 307200 + 102400, "/opt/homebrew/bin/node next dev") in detached, detached
+    assert not any(d[0] in (101, 102, 201, 500, 601, 701) for d in detached), detached
+    assert short_cmd(app[0][2]) == "node server.js" and short_cmd("/opt/homebrew/bin/node next dev") == "node next dev"
     assert [r[0] for r in rows] == [101, 201, 500], rows
     assert rows[0] == (101, "aaaaaaaa-0000-0000-0000-000000000001", 204800 + 512000, 512000), rows[0]
     assert rows[2][1] == "cccccccc-0000-0000-0000-000000000003", rows[2]
+    me_fp = footprints([os.getpid()]).get(os.getpid(), 0)
+    assert me_fp > 1024, me_fp  # this Python process: a few MB
+    assert with_footprints([(999999, 1, 77, "gone")]) == [(999999, 1, 77, "gone")]  # unreadable: RSS stays
     assert clean("a | b") == "a / b"
     assert parse_limit_mb("8") == 8192 and parse_limit_mb(" 8.5 GB ") == 8704 and parse_limit_mb("2048 mb") == 2048
     global SETTINGS

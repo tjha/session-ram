@@ -13,6 +13,30 @@ const PS = [
   ` 400 1 2048 /bin/zsh -c ps -axo command | grep '[M]acOS/claude --output-format'`,
 ].join('\n')
 
+// Build and test processes outside the session trees.
+const PS_BUILD = [
+  PS,
+  // Started with `&` by session A, so it moved under launchd; its worker stays under it.
+  ` 500 1 307200 /opt/homebrew/bin/node next dev`,
+  ` 501 500 102400 /opt/homebrew/bin/node worker.js`,
+  // Left by a session that is no longer loaded.
+  ` 600 1 204800 /opt/homebrew/bin/node vite`,
+  // A preview dev server the app started.
+  ` 700 2 1024 /Applications/Claude.app/Contents/Helpers/disclaimer -- node server.js`,
+  ` 701 700 51200 node server.js`,
+  // Not from any session.
+  ` 800 1 409600 /Applications/Firefox.app/Contents/MacOS/firefox`,
+].join('\n')
+const ENV = [
+  ` 301 ${CLAUDE} PATH=/bin CLAUDE_CODE_HOST_SESSION_ID=local_fresh HOME=/Users/x`,
+  ` 500 /opt/homebrew/bin/node next dev CLAUDE_CODE_HOST_SESSION_ID=local_a`,
+  ` 600 /opt/homebrew/bin/node vite CLAUDE_CODE_HOST_SESSION_ID=local_gone`,
+  ` 800 /Applications/Firefox.app/Contents/MacOS/firefox HOME=/Users/x`,
+].join('\n')
+
+// Memory footprints (with compressed memory), which replace ps's RSS where top has them.
+const TOP = ['Processes: 9 total', 'PID    MEM', '101    300M+', '102    0.5G', ''].join('\n')
+
 const LISTED = [
   { sessionId: 'local_a', title: 'Busy lint session', isRunning: true },
   { sessionId: 'local_b', title: 'Idle session', isRunning: false },
@@ -38,9 +62,12 @@ test('lists each session with its process-tree RAM and status, and flags the lim
   on('command.register', () => ({ value: { command: 'session-ram' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  // The second listing reads the environment of sessions no file maps (pid 301, started fresh).
+  // The second listing reads the environment of sessions no file maps (pid 301, started fresh)
+  // and of processes under launchd, to find the session that started them.
+  const envAsked: string[] = []
   on('process.run', (_, e) => {
-    const stdout = e.argv.includes('-wwE') ? ` 301 ${CLAUDE} PATH=/bin CLAUDE_CODE_HOST_SESSION_ID=local_fresh HOME=/Users/x` : PS
+    if (e.argv.includes('-wwE')) envAsked.push(String(e.argv.at(-1)))
+    const stdout = e.argv[0] === 'top' ? TOP : e.argv.includes('-wwE') ? ENV : PS_BUILD
     return { value: { exitCode: 0, stdout, stderr: '' } }
   })
   const CLI: Record<string, string> = {
@@ -77,10 +104,14 @@ test('lists each session with its process-tree RAM and status, and flags the lim
   await new Promise(r => setTimeout(r, 50))
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  // 200 MB session + 500 MB eslint child = 700 MB; idle one 100 MB; this one 51 MB; total 851 MB > 600 MB limit.
-  expect((await ui.find({ type: 'Text', text: /used of/ }))?.text).toBe('0.8 GB used of 0.6 GB limit')
-  expect((await ui.find({ type: 'Text', text: /700 MB/ }))?.text).toContain('● working')
-  expect((await ui.find({ type: 'Text', text: /100 MB/ }))?.text).toContain('○ idle')
+  // 300 MB session + 512 MB eslint (top's footprints) + 400 MB detached dev server = 1212 MB; idle one 100 MB;
+  // this one 51 MB; 200 MB left by a closed session + 51 MB preview server = 251 MB other; total 1614 MB > 600 MB.
+  expect((await ui.find({ type: 'Text', text: /used of/ }))?.text).toBe('1.6 GB used of 0.6 GB limit')
+  expect((await ui.find({ type: 'Text', text: /1212 MB/ }))?.text).toContain('● working')
+  expect((await ui.find({ type: 'Text', text: /1212 MB/ }))?.text).toContain('(912 MB child processes)')
+  expect((await ui.find({ type: 'Text', text: /dev servers/ }))?.text).toContain('251 MB')
+  expect(envAsked.at(-1)?.split(',')).toEqual(expect.arrayContaining(['301', '500', '600', '800']))
+  expect((await ui.find({ type: 'Text', text: /· 100 MB/ }))?.text).toContain('○ idle')
   expect(await ui.find({ type: 'Text', text: /^Idle session$/ })).toBeDefined()
   expect((await ui.find({ type: 'Text', text: /^This session/ }))?.text).toBe('This session: file title local_fresh')
   expect(await ui.find({ key: 'act-101' })).toBeDefined()
@@ -89,6 +120,8 @@ test('lists each session with its process-tree RAM and status, and flags the lim
   // The snapshot the menu-bar script reads.
   const status = JSON.parse(written['/Users/x/.claude/session-ram-status.json'] ?? '{}')
   expect(status.limitMb).toBe(600)
+  expect(status.otherMb).toBe(251)
+  expect(status.measuredBy).toBe('/Users/x')
   expect(status.rows.find((r: { sessionId: string }) => r.sessionId === 'local_b').isWorking).toBe(false)
   await ui.unmount()
 
@@ -431,4 +464,51 @@ test('an Auto-fix request is carried out only by its own session', async ($, on)
 
   expect(calls.filter(c => c.tool === 'set_monitor').map(c => c.args)).toEqual([{ auto_fix: false, address_comments: false, url: 'https://x/pull/11' }])
   expect(Object.keys(JSON.parse(written['/Users/x/.claude/session-ram-requests.json'] ?? '{}'))).toEqual(['autofix-off:local_s3'])
+})
+
+test('when another session measured this round, shows its snapshot instead of measuring again', async ($, on) => {
+  const row = { childMb: 0, isFlagged: false, isSelf: false }
+  const status = {
+    writtenAt: 1_000_000,
+    measuredBy: 'local_other',
+    rows: [
+      { ...row, pid: 1, sessionId: 'local_self', title: 'Mine', mb: 400, isWorking: true, isSelf: false },
+      { ...row, pid: 2, sessionId: 'local_other', title: 'Measurer', mb: 300, isWorking: true, isSelf: true },
+    ],
+    otherMb: 24,
+    totalMb: 724,
+  }
+  const ran: string[] = []
+  on('command.register', () => ({ value: { command: 'session-ram' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/Users/x' : e.name === 'CLAUDE_CODE_HOST_SESSION_ID' ? 'local_self' : undefined }))
+  on('process.run', (_, e) => {
+    ran.push(String(e.argv[0]))
+    return { value: { exitCode: 0, stdout: '', stderr: '' } }
+  })
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', (_, e) => {
+    if (String(e.path).endsWith('session-ram-status.json')) return { value: JSON.stringify(status) }
+    throw new Error('ENOENT')
+  })
+  on('fs.write', () => ({ value: undefined }))
+  on('mcp.call', () => text({}))
+  on('tool.register', () => ({ value: { tool: 'mcp__session-ram__snapshot' } }))
+  on('clock.every', () => ({ value: {} }))
+  on('clock.now', () => ({ value: 1_005_000 }))
+  on('ui.toast', () => ({ value: undefined }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await new Promise(r => setTimeout(r, 50))
+
+  expect(ran).toEqual([])
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /used of/ }))?.text).toBe('0.7 GB used of 6.0 GB limit')
+  expect(await ui.find({ type: 'Text', text: /^This session: Mine$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Measurer$/ })).toBeDefined()
+  // This session can stop the measurer's turn, not its own.
+  expect(await ui.find({ key: 'act-2' })).toBeDefined()
+  expect(await ui.find({ key: 'act-1' })).toBeUndefined()
+  await ui.unmount()
 })

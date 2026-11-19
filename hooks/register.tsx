@@ -18,8 +18,8 @@ const STOP_GAP_MS = 20_000
 
 const view = atom(
   { plugin: 'session-ram', key: 'view' } as const,
-  { rows: [], totalMb: 0, limitMb: DEFAULT_LIMIT_MB, isAuto: false, note: 'Measuring…' },
-  { shape: 'view-2' },
+  { rows: [], otherMb: 0, totalMb: 0, limitMb: DEFAULT_LIMIT_MB, isAuto: false, note: 'Measuring…' },
+  { shape: 'view-3' },
 )
 
 type Proc = { pid: number; ppid: number; kb: number; cmd: string }
@@ -38,6 +38,9 @@ const errText = (err: unknown) => String(err).slice(0, 300)
 const gb = (mb: number) => `${(mb / 1024).toFixed(1)} GB`
 
 const PS_ARGV = ['ps', '-axww', '-o', 'pid=,ppid=,rss=,command=']
+// Each process's memory footprint, what Activity Monitor shows. ps's RSS leaves out memory macOS
+// compressed, often half of an idle session's. Costs ~0.4 s of CPU, so one session measures for all.
+const TOP_ARGV = ['top', '-l', '1', '-stats', 'pid,mem']
 const WIN_QUERY = 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,WorkingSetSize,CommandLine | ConvertTo-Json -Compress'
 const WIN_ARGV = ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', WIN_QUERY]
 
@@ -49,6 +52,17 @@ export function parsePs(out: string): Proc[] {
     if (m) procs.push({ pid: Number(m[1]), ppid: Number(m[2]), kb: Number(m[3]), cmd: m[4] ?? '' })
   }
   return procs
+}
+
+/** macOS `top -l 1 -stats pid,mem`: pid -> memory footprint in KB ("363M", "1008K", "1.2G"; a trailing +/- marks a change). */
+export function parseTop(out: string): Map<number, number> {
+  const unitKb: Record<string, number> = { B: 1 / 1024, K: 1, M: 1024, G: 1024 ** 2, T: 1024 ** 3 }
+  const kb = new Map<number, number>()
+  for (const line of out.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+(?:\.\d+)?)([BKMGT])[+-]?\s*$/.exec(line)
+    if (m) kb.set(Number(m[1]), Math.round(Number(m[2]) * (unitKb[m[3] ?? 'K'] ?? 1)))
+  }
+  return kb
 }
 
 type WinProc = { ProcessId?: number; ParentProcessId?: number; WorkingSetSize?: number; CommandLine?: string | null }
@@ -64,15 +78,29 @@ export function parseWin(out: string): Proc[] {
   }))
 }
 
-/** Session processes, each with the RAM of its whole process tree, and which one runs this mod. */
+/**
+ * Session processes, each with the RAM of its whole process tree, and which one runs this mod.
+ * Also what builds and tests leave outside those trees: `appKb`, what the app started through its
+ * launcher (preview dev servers, MCP servers), and `detached`, processes that moved under launchd
+ * (pid 1) when started with `&`, nohup or as a daemon; measure() reads their environment to find
+ * the session that started them.
+ */
 export function sessionProcs(procs: Proc[]) {
   const kids = new Map<number, Proc[]>()
   for (const p of procs) {
     if (p.pid !== p.ppid) kids.set(p.ppid, [...(kids.get(p.ppid) ?? []), p])
   }
+  // Every process is counted once: a tree walked later skips what an earlier one counted.
+  const counted = new Set<number>()
   // shortcut: Windows reuses PIDs, so an orphan can be counted under a new process with its dead parent's PID; rare, check CreationDate if it shows up.
   const treeKb = (pid: number, depth = 0): number =>
-    depth > 50 ? 0 : (kids.get(pid) ?? []).reduce((sum, c) => sum + c.kb + treeKb(c.pid, depth + 1), 0)
+    depth > 50
+      ? 0
+      : (kids.get(pid) ?? []).reduce((sum, c) => {
+          if (counted.has(c.pid)) return sum
+          counted.add(c.pid)
+          return sum + c.kb + treeKb(c.pid, depth + 1)
+        }, 0)
 
   // The desktop app starts each session as `<path>/claude[.exe] --output-format ...`: the program
   // itself must be claude, not a shell or grep whose arguments mention it. A launcher that still
@@ -83,14 +111,22 @@ export function sessionProcs(procs: Proc[]) {
   }
   const matched = procs.filter(p => isSession(p.cmd))
   const matchedPids = new Set(matched.map(p => p.pid))
+  const isWrapper = (p: Proc) => (kids.get(p.pid) ?? []).some(c => matchedPids.has(c.pid))
   const roots = matched
-    .filter(p => !(kids.get(p.pid) ?? []).some(c => matchedPids.has(c.pid)))
-    .map(p => ({
-      pid: p.pid,
-      cli: /--(?:resume|session-id)[= ]"?([0-9a-f-]{36})/.exec(p.cmd)?.[1],
-      kb: p.kb,
-      childKb: treeKb(p.pid),
-    }))
+    .filter(p => !isWrapper(p))
+    .map(p => {
+      counted.add(p.pid)
+      return { pid: p.pid, cli: /--(?:resume|session-id)[= ]"?([0-9a-f-]{36})/.exec(p.cmd)?.[1], kb: p.kb, childKb: treeKb(p.pid) }
+    })
+  const ownKb = (p: Proc) => {
+    counted.add(p.pid)
+    return p.kb + treeKb(p.pid)
+  }
+  // The macOS app starts sessions, preview dev servers and MCP servers through Helpers/disclaimer.
+  const appKb = procs
+    .filter(p => /[\\/]Helpers[\\/]disclaimer\b/.test(p.cmd) && !isWrapper(p))
+    .reduce((sum, p) => (counted.has(p.pid) ? sum : sum + ownKb(p)), 0)
+  const detached = procs.filter(p => p.ppid === 1 && !counted.has(p.pid)).map(p => ({ pid: p.pid, kb: ownKb(p) }))
 
   // This session is the root above the process listing it just ran.
   const byPid = new Map(procs.map(p => [p.pid, p]))
@@ -98,7 +134,7 @@ export function sessionProcs(procs: Proc[]) {
   let cur = procs.find(p => p.cmd.startsWith('ps -axww') || p.cmd.includes('Get-CimInstance Win32_Process'))
   for (let hops = 0; cur && !rootPids.has(cur.pid) && hops < 50; hops++) cur = byPid.get(cur.ppid)
 
-  return { roots, selfPid: cur && rootPids.has(cur.pid) ? cur.pid : undefined }
+  return { roots, appKb, detached, selfPid: cur && rootPids.has(cur.pid) ? cur.pid : undefined }
 }
 
 const isWindows = async ($: Engine) => (await $.env.get('OS')) === 'Windows_NT'
@@ -146,16 +182,26 @@ async function scanSessionFiles($: Engine) {
   }
 }
 
-async function measure($: Engine): Promise<{ rows: Row[]; note: string }> {
+async function measure($: Engine): Promise<{ rows: Row[]; otherMb: number; note: string }> {
   const win = await isWindows($)
-  const listing = await $.process.run(win ? WIN_ARGV : PS_ARGV)
-  const { roots, selfPid } = sessionProcs(win ? parseWin(listing.stdout) : parsePs(listing.stdout))
-  // A session started fresh in this app run has no --resume id; on macOS its environment names it.
-  // shortcut: Windows can't read another process's environment, so fresh sessions there show as unknown until resumed.
+  const [listing, top] = await Promise.all([
+    $.process.run(win ? WIN_ARGV : PS_ARGV),
+    win ? undefined : $.process.run(TOP_ARGV).catch(() => undefined),
+  ])
+  let procs = win ? parseWin(listing.stdout) : parsePs(listing.stdout)
+  // Without top's figure (it failed, or the process started after it ran), RSS stands in.
+  const footprint = parseTop(top?.stdout ?? '')
+  procs = procs.map(p => ({ ...p, kb: footprint.get(p.pid) ?? p.kb }))
+  const { roots, appKb, detached, selfPid } = sessionProcs(procs)
+  // A session started fresh in this app run has no --resume id; on macOS its environment names it,
+  // and so does the environment of a build or test process that detached from it (inherited).
+  // shortcut: Windows can't read another process's environment, so fresh sessions there show as unknown until resumed
+  // and detached processes aren't counted.
   const hostIds = new Map<number, string>()
   const unnamed = roots.filter(p => !(p.cli && cliToMeta.has(p.cli)))
-  if (!win && unnamed.length > 0) {
-    const env = await $.process.run(['ps', '-wwE', '-o', 'pid=,command=', '-p', unnamed.map(p => p.pid).join(',')])
+  const envPids = [...unnamed, ...detached].map(p => p.pid)
+  if (!win && envPids.length > 0) {
+    const env = await $.process.run(['ps', '-wwE', '-o', 'pid=,command=', '-p', envPids.join(',')])
     for (const line of env.stdout.split('\n')) {
       const m = /^\s*(\d+)\s.*\bCLAUDE_CODE_HOST_SESSION_ID=(local_[\w-]+)/.exec(line)
       if (m) hostIds.set(Number(m[1]), m[2] ?? '')
@@ -179,18 +225,30 @@ async function measure($: Engine): Promise<{ rows: Row[]; note: string }> {
     }),
   )
 
+  // Detached processes go to the loaded session that started them; the rest (from a session since
+  // closed) count with what the app started.
+  const detachedKb = new Map<string, number>()
+  let otherKb = appKb
+  const loadedIds = new Set(roots.map(p => sessionIdOf(p)))
+  for (const d of detached) {
+    const sid = hostIds.get(d.pid)
+    if (sid && loadedIds.has(sid)) detachedKb.set(sid, (detachedKb.get(sid) ?? 0) + d.kb)
+    else if (sid) otherKb += d.kb
+  }
+
   const rows = roots
     .map(p => {
       const sid = sessionIdOf(p)
       const s = sid ? listed.get(sid) : undefined
       const isSelf = p.pid === selfPid
       const name = s?.title ?? (sid ? titleById.get(sid) : undefined)
+      const childKb = p.childKb + (sid ? (detachedKb.get(sid) ?? 0) : 0)
       return {
         pid: p.pid,
         sessionId: sid ?? null,
-        title: isSelf ? `This session${name ? `: ${name}` : ''}` : (name ?? `Unknown session (pid ${p.pid})`),
-        mb: Math.round((p.kb + p.childKb) / 1024),
-        childMb: Math.round(p.childKb / 1024),
+        title: name ?? `Unknown session (pid ${p.pid})`,
+        mb: Math.round((p.kb + childKb) / 1024),
+        childMb: Math.round(childKb / 1024),
         // This session asks about itself too: an idle session running the mod is not working.
         isWorking: s ? s.isRunning : isSelf ? true : null,
         isSelf,
@@ -199,7 +257,7 @@ async function measure($: Engine): Promise<{ rows: Row[]; note: string }> {
     })
     .sort((a, b) => b.mb - a.mb)
 
-  return { rows, note }
+  return { rows, otherMb: Math.round(otherKb / 1024), note }
 }
 
 async function archive($: Engine, row: Row) {
@@ -281,7 +339,7 @@ async function handleRequests($: Engine) {
       }
     }
   }
-  await tick($)
+  await tick($, true)
   await scanAutofix($, true)
 }
 
@@ -345,10 +403,13 @@ async function readFlags($: Engine): Promise<Flags> {
   }
 }
 
-/** One check at a time per session: the timer, Refresh and a press can overlap, and two overlapping checks would each stop a session. */
-function tick($: Engine): Promise<void> {
+/**
+ * One check at a time per session: the timer, Refresh and a press can overlap, and two overlapping checks would each stop a session.
+ * isForced measures even when another session measured this round (Refresh, after a stop).
+ */
+function tick($: Engine, isForced = false): Promise<void> {
   // A check that fails (the module reloading under it, a file it can't write) is retried by the next one.
-  inFlight ??= runTick($)
+  inFlight ??= runTick($, isForced)
     .catch(() => {})
     .finally(() => {
     inFlight = undefined
@@ -356,16 +417,40 @@ function tick($: Engine): Promise<void> {
   return inFlight
 }
 
-async function runTick($: Engine) {
+type Status = { writtenAt: number; measuredBy?: string; rows: Row[]; otherMb?: number; totalMb: number }
+
+async function readStatus($: Engine): Promise<Status | undefined> {
+  try {
+    const s = JSON.parse(await $.fs.read(`${await claudeDir($)}/session-ram-status.json`))
+    return typeof s.writtenAt === 'number' && Array.isArray(s.rows) && typeof s.totalMb === 'number' ? s : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function runTick($: Engine, isForced = false) {
   const { limitMb, isAuto } = await readSettings($)
+  const selfId = await $.env.get('CLAUDE_CODE_HOST_SESSION_ID')
+  // Another session measured this round: show its snapshot. It also runs Auto, so only one session stops turns.
+  const shared = isForced ? undefined : await readStatus($)
+  // A snapshot without measuredBy is from an older version of this mod, which measured RSS.
+  if (shared?.measuredBy && shared.measuredBy !== selfId && (await $.clock.now()) - shared.writtenAt < TICK_MS - 3_000) {
+    const isOver = shared.totalMb > limitMb
+    if (isOver && !wasOver) $.ui.toast(`Sessions use ${gb(shared.totalMb)}, over your ${gb(limitMb)} limit.`)
+    wasOver = isOver
+    const rows = shared.rows.map(r => ({ ...r, isSelf: !!selfId && r.sessionId === selfId }))
+    await update($, view, () => ({ rows, otherMb: shared.otherMb ?? 0, totalMb: shared.totalMb, limitMb, isAuto, note: '' }))
+    return
+  }
   let rows: Row[] = []
+  let otherMb = 0
   let note = ''
   try {
-    ;({ rows, note } = await measure($))
+    ;({ rows, otherMb, note } = await measure($))
   } catch (err) {
     note = `Could not measure: ${errText(err)}`
   }
-  const totalMb = rows.reduce((sum, r) => sum + r.mb, 0)
+  const totalMb = rows.reduce((sum, r) => sum + r.mb, otherMb)
   const now = await $.clock.now()
   const flags = await readFlags($)
   const before = JSON.stringify(flags)
@@ -404,9 +489,9 @@ async function runTick($: Engine) {
     await $.fs.write(`${await claudeDir($)}/session-ram-stopped.json`, JSON.stringify(flags)).catch(() => {})
   }
   rows = rows.map(r => ({ ...r, isFlagged: !!(r.sessionId && flags[r.sessionId]) }))
-  await update($, view, () => ({ rows, totalMb, limitMb, isAuto, note }))
+  await update($, view, () => ({ rows, otherMb, totalMb, limitMb, isAuto, note }))
   if (rows.length > 0) {
-    const status = { writtenAt: now, rows, totalMb, limitMb, isAuto }
+    const status = { writtenAt: now, measuredBy: selfId, rows, otherMb, totalMb, limitMb, isAuto }
     await $.fs.write(`${await claudeDir($)}/session-ram-status.json`, JSON.stringify(status)).catch(() => {})
   }
 }
@@ -453,7 +538,7 @@ async function act($: Engine, row: Row) {
   } else {
     $.ui.toast(await archive($, row))
   }
-  await tick($)
+  await tick($, true)
 }
 
 export const register: Register = on => {
@@ -475,7 +560,7 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'mcp__session-ram__snapshot' }, async $ => {
-    await tick($)
+    await tick($, true)
 
     return { result: JSON.stringify(await read($, view), null, 1) }
   })
@@ -511,7 +596,7 @@ export const register: Register = on => {
           <Button key="down" label="− 1 GB" onPress={() => void setLimit($, -1024)} />
           <Button key="up" label="+ 1 GB" onPress={() => void setLimit($, 1024)} />
           <Button key="auto" label={v.isAuto ? 'Auto: on' : 'Auto: off'} onPress={() => void toggleAuto($)} />
-          <Button key="refresh" label="Refresh" onPress={() => void tick($)} />
+          <Button key="refresh" label="Refresh" onPress={() => void tick($, true)} />
         </Box>
         {e.surface !== 'mobile' &&
           (() => {
@@ -525,12 +610,17 @@ export const register: Register = on => {
               {r.isFlagged ? '⚠ stopped (over limit)' : r.isWorking ? '● working' : r.isWorking === false ? '○ idle' : '? unknown'} · {r.mb} MB
               {r.childMb > 0 ? ` (${r.childMb} MB child processes)` : ''}
             </Text>
-            <Text dimColor={r.isWorking === false}>{r.title}</Text>
+            <Text dimColor={r.isWorking === false}>{r.isSelf ? `This session: ${r.title}` : r.title}</Text>
             {!r.isSelf && r.sessionId && r.isWorking !== null && (
               <Button key={`act-${r.pid}`} label={r.isWorking ? 'Stop turn' : 'Archive'} onPress={() => void act($, r)} />
             )}
           </Box>
         ))}
+        {v.otherMb > 0 && (
+          <Text dimColor>
+            {v.otherMb} MB in dev servers and MCP servers the app started, and processes left by closed sessions (counted in the total).
+          </Text>
+        )}
         {v.note !== '' && <Text dimColor>{v.note}</Text>}
       </Box>
     )
