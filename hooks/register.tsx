@@ -124,7 +124,8 @@ async function scanSessionFiles($: Engine) {
   for (const org of await subdirs(root)) {
     for (const account of await subdirs(org)) {
       for (const e of await $.fs.list(account)) {
-        if (e.kind === 'file' && e.name.endsWith('.json')) files.push(`${account}/${base(e.name)}`)
+        // Session files are local_<id>.json; the app keeps other files there too (mod-commands.json is a list).
+        if (e.kind === 'file' && /^local_.*\.json$/.test(base(e.name))) files.push(`${account}/${base(e.name)}`)
       }
     }
   }

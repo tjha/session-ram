@@ -28,17 +28,20 @@ STATE = os.path.join(CLAUDE_DIR, "session-ram-menubar-state.json")
 REQUESTS = os.path.join(CLAUDE_DIR, "session-ram-requests.json")
 AUTOFIX = os.path.join(CLAUDE_DIR, "session-ram-autofix.json")
 AUTOFIX_STALE_MS = 10 * 60_000
-SESSIONS_GLOB = os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions/*/*/*.json")
+# Session files are local_<id>.json; the app keeps other files there too (mod-commands.json is a list).
+SESSIONS_GLOB = os.path.expanduser("~/Library/Application Support/Claude/claude-code-sessions/*/*/local_*.json")
 DEFAULT_LIMIT_MB = 6144
 STATUS_FRESH_MS = 60_000
 
 
 def read_json(path, default):
+    """The file's JSON, or `default` when it's missing, unreadable, or not the same kind (dict, list) as `default`."""
     try:
         with open(path) as f:
-            return json.load(f)
+            value = json.load(f)
     except (OSError, ValueError):
         return default
+    return value if isinstance(value, type(default)) else default
 
 
 def write_json(path, value):
@@ -351,6 +354,12 @@ def selftest():
     assert "param1=autofix-off param2=local_a" in lines[4], lines[4]
     assert lines[5].startswith("--· #12  B  (CI: running)") and lines[8] == "----Turning off… (when the session next runs)", lines
     assert autofix_lines({}, {}, set(), set(), {}, now, "/me")[0].startswith("Auto-fix: not checked yet")
+    odd = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"session-ram-selftest-list-{os.getpid()}.json")
+    write_json(odd, [{"folder": "/x"}])
+    try:
+        assert read_json(odd, {}) == {}, "a list where an object belongs reads as the default"
+    finally:
+        os.remove(odd)
     assert parse_limit_mb("512 MB") is None and parse_limit_mb("lots") is None and parse_limit_mb("") is None
     print("selftest ok")
 

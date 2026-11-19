@@ -357,6 +357,8 @@ const autofixMocks = (on: Parameters<Parameters<typeof test>[1]>[1], written: Re
     'local_s2.json': { sessionId: 'local_s2', title: 'Merged PR with Auto-fix' },
     'local_s3.json': { sessionId: 'local_s3', title: 'Open PR, Auto-fix off' },
     'local_s4.json': { sessionId: 'local_s4', title: 'Archived', isArchived: true },
+    // Not a session: the app keeps other files in the same folder.
+    'mod-commands.json': [{ folder: '/x' }],
   }
   on('command.register', () => ({ value: { command: 'session-ram' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))

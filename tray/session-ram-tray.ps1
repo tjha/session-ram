@@ -128,7 +128,7 @@ function Get-SessionMeta {
     $byCli = @{}
     $titles = @{}
     if (Test-Path -LiteralPath $SessionsRoot) {
-        foreach ($f in Get-ChildItem -LiteralPath $SessionsRoot -Recurse -Depth 2 -Filter '*.json' -File) {
+        foreach ($f in Get-ChildItem -LiteralPath $SessionsRoot -Recurse -Depth 2 -Filter 'local_*.json' -File) {
             $d = Read-Json $f.FullName
             if (-not $d -or -not $d.sessionId) { continue }
             $titles[$d.sessionId] = $(if ($d.title) { $d.title } else { $d.sessionId })
