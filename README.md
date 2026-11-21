@@ -22,7 +22,13 @@ Both show every session loaded in memory, largest first, with its RAM and its st
 
 **Limit and Auto.** Set a RAM limit (default 6 GB) by typing a value like `8` or `8 GB`, or with the presets. Going over it warns you. With **Auto** on, while you're over the limit it stops the in-progress turn of the largest working session and flags it red, one session every 20 seconds at most. **Auto never archives or closes anything**, and it's off by default. The limit can't hard-cap RAM: it warns and, with Auto, stops turns. Stopping a turn ends the command running in it, but not processes that run in the background, such as dev servers; end those yourself.
 
-**Auto-fix PRs (menu bar).** Auto-fix wakes a session whenever its PR's CI fails or gets a review comment, so several can start working at once. The menu bar lists every open PR with Auto-fix on, which of their sessions are running right now (● green), the CI state, and links to the PR and the session. **Turn off Auto-fix** switches it off for that PR. The app only lets a session change its own Auto-fix, so this happens the next time that session runs, and Claude may ask you to approve it there. Sessions with Auto-fix also show **↻ Auto-fix** in the main list.
+**Auto-fix PRs (menu bar).** Auto-fix wakes a session whenever its PR's CI fails or gets a review comment, so several can start working at once. The menu bar lists every open PR with Auto-fix on, which of their sessions are running right now (● green), the CI state, and links to the PR and the session. **Turn off Auto-fix** switches it off for that PR, and **Turn off Auto-fix for all** does it for every PR listed. The app only lets a session change its own Auto-fix. A session that's loaded does it within a few seconds. Any other session does it the next time it runs, before Auto-fix can wake it again. Claude may ask you to approve it in each session.
+
+The same from Terminal, in one command:
+
+```bash
+~/SwiftBarPlugins/session-ram.15s.py autofix-off all
+``` Sessions with Auto-fix also show **↻ Auto-fix** in the main list.
 
 **Panel on start.** The panel opens by itself when a session starts. If you use the menu bar or tray instead, switch off **Open panel when a session starts** in their menu; you can still open the panel with `/session-ram`.
 

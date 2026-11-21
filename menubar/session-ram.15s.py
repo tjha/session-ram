@@ -242,11 +242,16 @@ def act(args):
             notify("No Claude session is running the session-ram mod, so the stop can't happen yet. Open a new Claude session.")
         return
     elif args[0] == "autofix-off":
-        # Only the session itself can switch off its PR's Auto-fix; the mod in it does so once it runs.
+        # Only the session itself can switch off its PR's Auto-fix; the mod in it does so once it runs
+        # (within seconds if it's loaded). "all": every session the last Auto-fix check found.
+        ids = [a.get("sessionId") for a in read_json(AUTOFIX, {}).get("sessions") or []] if args[1] == "all" else [args[1]]
+        ids = [i for i in ids if isinstance(i, str)]
         requests = read_json(REQUESTS, {})
-        requests[f"autofix-off:{args[1]}"] = {"action": "autofix-off", "session": args[1], "at": time.time() * 1000}
+        for sid in ids:
+            requests[f"autofix-off:{sid}"] = {"action": "autofix-off", "session": sid, "at": time.time() * 1000}
         write_json(REQUESTS, requests)
-        notify("Auto-fix turns off the next time that session runs. Claude may ask you to approve it there.")
+        what = "that session" if len(ids) == 1 else f"each of the {len(ids)} sessions"
+        notify(f"Auto-fix turns off for {what}: right away if it's loaded, otherwise the next time it runs. Claude may ask you to approve it there.")
         return
     elif args[0] == "panel":
         s["autoOpenPanel"] = not s["autoOpenPanel"]
@@ -268,6 +273,10 @@ def autofix_lines(autofix, working, loaded, pending_af, titles, now_ms, me):
     n_running = sum(1 for a in found if working.get(a["sessionId"]))
     head = f"Auto-fix on: {len(found)} open PR{'' if len(found) == 1 else 's'}" + (f", {n_running} running now" if n_running else "")
     lines = [f"{head} (checked {when}){' | color=orange' if n_running > 1 else ''}"]
+    n_left = sum(1 for a in found if a["sessionId"] not in pending_af)
+    if n_left > 1:
+        lines.append(f"--Turn off Auto-fix for all {n_left} | bash={json.dumps(me)} param1=autofix-off param2=all terminal=false refresh=true")
+        lines.append("-----")
     for a in found:
         sid = a["sessionId"]
         if working.get(sid):
@@ -439,6 +448,23 @@ def selftest():
     assert "param1=autofix-off param2=local_a" in lines[4], lines[4]
     assert lines[5].startswith("--· #12  B  (CI: running)") and lines[8] == "----Turning off… (when the session next runs)", lines
     assert autofix_lines({}, {}, set(), set(), {}, now, "/me")[0].startswith("Auto-fix: not checked yet")
+    lines = autofix_lines(af, {}, set(), set(), {}, now, "/me")
+    assert lines[1] == '--Turn off Auto-fix for all 2 | bash="/me" param1=autofix-off param2=all terminal=false refresh=true', lines[1]
+    global REQUESTS, AUTOFIX, notify
+    saved_paths = REQUESTS, AUTOFIX, notify
+    tmp = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"session-ram-selftest-{os.getpid()}")
+    REQUESTS, AUTOFIX, notify = tmp + "-requests.json", tmp + "-autofix.json", lambda text: None
+    try:
+        write_json(REQUESTS, {"local_x": {"action": "stop", "at": 1}})
+        write_json(AUTOFIX, af)
+        act(["autofix-off", "all"])
+        queued = read_json(REQUESTS, {})
+        assert sorted(queued) == ["autofix-off:local_a", "autofix-off:local_b", "local_x"], queued
+        assert queued["autofix-off:local_b"]["session"] == "local_b" and queued["autofix-off:local_b"]["action"] == "autofix-off"
+    finally:
+        for path in (REQUESTS, AUTOFIX):
+            os.remove(path)
+        REQUESTS, AUTOFIX, notify = saved_paths
     odd = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"session-ram-selftest-list-{os.getpid()}.json")
     write_json(odd, [{"folder": "/x"}])
     try:
